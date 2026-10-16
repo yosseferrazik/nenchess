@@ -1,0 +1,27 @@
+//! Thin re-export of the contract generated from `crates/protocol`.
+//!
+//! Nothing here is hand-written except helpers; the types themselves come
+//! from the Rust source of truth (`cargo test -p protocol` regenerates them
+//! into `src/lib/generated`).
+
+export type { AppliedMoveDto } from './generated/AppliedMoveDto';
+export type { AuthResponse } from './generated/AuthResponse';
+export type { ClockDto } from './generated/ClockDto';
+export type { ClientMessage } from './generated/ClientMessage';
+export type { ColorDto } from './generated/ColorDto';
+export type { CreateGameRequest } from './generated/CreateGameRequest';
+export type { ErrorCode } from './generated/ErrorCode';
+export type { ErrorDto } from './generated/ErrorDto';
+export type { GameResultDto } from './generated/GameResultDto';
+export type { GameStatusDto } from './generated/GameStatusDto';
+export type { GameView } from './generated/GameView';
+export type { GamesResponse } from './generated/GamesResponse';
+export type { LoginRequest } from './generated/LoginRequest';
+export type { MoveDto } from './generated/MoveDto';
+export type { MoveInputDto } from './generated/MoveInputDto';
+export type { PieceKindDto } from './generated/PieceKindDto';
+export type { PlayerDto } from './generated/PlayerDto';
+export type { RegisterRequest } from './generated/RegisterRequest';
+export type { ResultReasonDto } from './generated/ResultReasonDto';
+export type { ServerMessage } from './generated/ServerMessage';
+export type { UserDto } from './generated/UserDto';

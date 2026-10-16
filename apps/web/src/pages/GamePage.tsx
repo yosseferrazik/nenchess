@@ -1,0 +1,164 @@
+import { useGameSocket } from '../lib/ws';
+import { Board } from '../components/Board';
+import { Clock } from '../components/Clock';
+import { useAuth } from '../lib/auth';
+import type { GameView } from '../lib/protocol';
+
+export function GamePage({ gameId }: { gameId: string }) {
+  const { session } = useAuth();
+  const { state, move, resign, clearError } = useGameSocket(gameId);
+  const { game } = state;
+
+  const myColor = colorOf(game, session?.user.id ?? null);
+  const lastMove = lastMoveOf(game);
+  const interactive =
+    game?.status === 'active' && myColor !== null && game.turn === myColor && !state.pending;
+
+  return (
+    <section className="game">
+      <header className="game-header">
+        <h2>Partida</h2>
+        <span className={`badge ${state.status}`}>
+          {state.status === 'open' ? 'en línea' : state.status === 'connecting' ? 'conectando…' : 'desconectado'}
+        </span>
+      </header>
+
+      {state.lastError ? (
+        <div className="error-banner" onClick={clearError} role="alert">
+          {state.lastError} <small>(clic para descartar)</small>
+        </div>
+      ) : null}
+
+      {!game ? (
+        <p className="muted">Cargando partida…</p>
+      ) : (
+        <div className="game-layout">
+          <div className="board-column">
+            <PlayerRow game={game} side="black" fallback="(esperando rival)" />
+            <Board
+              fen={game.fen}
+              orientation={myColor === 'black' ? 'black' : 'white'}
+              interactive={interactive}
+              lastMove={lastMove}
+              onMove={(from, to, promotion) => {
+                void move(from, to, promotion).catch((error: Error) => {
+                  /* surfaced through state.lastError when the server answers */
+                  console.warn(error.message);
+                });
+              }}
+            />
+            <PlayerRow game={game} side="white" fallback={myColor === null ? '(asiento vacío)' : ''} />
+          </div>
+
+          <aside className="side-panel">
+            <StatusPanel game={game} myColor={myColor} />
+            {myColor !== null && game.status === 'active' ? (
+              <button type="button" className="danger" onClick={() => { if (confirm('¿Abandonar la partida?')) void resign(); }}>
+                Abandonar
+              </button>
+            ) : null}
+            <h3>Jugadas</h3>
+            <MoveList game={game} />
+            {game.id ? (
+              <p className="muted small">
+                id de partida: <code>{game.id}</code>
+              </p>
+            ) : null}
+          </aside>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function colorOf(game: GameView | null, userId: string | null): 'white' | 'black' | null {
+  if (!game || !userId) return null;
+  if (game.white?.user_id === userId) return 'white';
+  if (game.black?.user_id === userId) return 'black';
+  return null;
+}
+
+function lastMoveOf(game: GameView | null) {
+  if (!game || game.moves.length === 0) return null;
+  const last = game.moves[game.moves.length - 1];
+  return { from: last.from, to: last.to };
+}
+
+function PlayerRow({ game, side, fallback }: { game: GameView; side: 'white' | 'black'; fallback: string }) {
+  const player = side === 'white' ? game.white : game.black;
+  const clock = game.clock;
+  return (
+    <div className="player-row">
+      <span className="player-name">
+        {player?.username ?? fallback}
+        <small className="muted"> {side === 'white' ? '· blancas' : '· negras'}</small>
+      </span>
+      <Clock clock={clock} side={side} label={side === 'white' ? 'blancas' : 'negras'} />
+    </div>
+  );
+}
+
+function StatusPanel({ game, myColor }: { game: GameView; myColor: 'white' | 'black' | null }) {
+  if (game.status === 'waiting') {
+    return (
+      <div className="status-panel">
+        <strong>Esperando rival</strong>
+        <p className="muted small">Comparte el id de la partida para que se unan.</p>
+      </div>
+    );
+  }
+  if (game.status === 'finished') {
+    const result = game.result;
+    const winner =
+      result?.winner === 'white' ? game.white?.username : result?.winner === 'black' ? game.black?.username : null;
+    return (
+      <div className="status-panel">
+        <strong>{winner ? `Ganó ${winner}` : 'Tablas'}</strong>
+        <p className="muted small">Motivo: {result?.reason ?? 'desconocido'}</p>
+      </div>
+    );
+  }
+  return (
+    <div className="status-panel">
+      <strong>
+        {myColor === null
+          ? 'Observando'
+          : game.turn === myColor
+            ? 'Tu turno'
+            : 'Turno del rival'}
+      </strong>
+      <p className="muted small">
+        versión {game.version} · {game.move_count} jugadas · {Math.round(game.initial_time_ms / 1000)}s
+        {game.increment_ms > 0 ? ` + ${Math.round(game.increment_ms / 1000)}s` : ''}
+      </p>
+    </div>
+  );
+}
+
+function MoveList({ game }: { game: GameView }) {
+  if (game.moves.length === 0) return <p className="muted small">Sin jugadas todavía.</p>;
+
+  const rows: { number: number; white?: string; black?: string }[] = [];
+  game.moves.forEach((move) => {
+    const number = Math.ceil(move.move_number / 2);
+    let row = rows.find((entry) => entry.number === number);
+    if (!row) {
+      row = { number };
+      rows.push(row);
+    }
+    if (move.move_number % 2 === 1) row.white = move.uci;
+    else row.black = move.uci;
+  });
+
+  return (
+    <ol className="moves">
+      {rows.map((row) => (
+        <li key={row.number}>
+          <span className="move-number">{row.number}.</span>
+          <span className="uci">{row.white ?? '…'}</span>
+          <span className="uci">{row.black ?? ''}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}

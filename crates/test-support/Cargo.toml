@@ -1,0 +1,8 @@
+[package]
+name = "test-support"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game-core = { workspace = true }
+uuid = { workspace = true }

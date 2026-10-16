@@ -1,0 +1,20 @@
+[package]
+name = "nenchess-integration"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+futures-util = { workspace = true }
+game-core = { workspace = true }
+nenchess-api = { workspace = true }
+protocol = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+test-support = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+uuid = { workspace = true }

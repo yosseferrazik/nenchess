@@ -1,0 +1,10 @@
+# Build artefacts and local state that must never enter the build context.
+target/
+node_modules/
+apps/web/dist/
+.git/
+.github/
+*.log
+.env
+.env.*
+!.env.example
