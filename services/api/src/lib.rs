@@ -20,6 +20,7 @@ pub mod modules;
 pub mod transport;
 
 pub use bootstrap::{
-    build_router, build_state, run_migrations, serve, spawn_outbox_dispatcher, AppState,
+    build_router, build_state, run_migrations, serve, spawn_matchmaking_scheduler,
+    spawn_outbox_dispatcher, AppState,
 };
 pub use config::Config;

@@ -4,6 +4,8 @@
 pub mod auth;
 pub mod games;
 pub mod health;
+pub mod matchmaking;
+pub mod profile;
 
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -31,6 +33,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/games", post(games::create).get(games::list))
         .route("/games/{id}", get(games::get))
         .route("/games/{id}/join", post(games::join))
+        .route(
+            "/matchmaking",
+            post(matchmaking::enqueue)
+                .delete(matchmaking::dequeue)
+                .get(matchmaking::status),
+        )
+        .route("/profile", get(profile::get_profile))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_auth,

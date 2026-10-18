@@ -9,7 +9,7 @@ use crate::domain::{Game, GameResult, GameStatus, MoveRecord, ResultReason};
 
 const GAME_COLUMNS: &str = "id, white_player_id, black_player_id, status, fen, side_to_move, \
      version, move_count, initial_time_ms, increment_ms, rated, white_time_ms, black_time_ms, \
-     turn_started_at, result_winner, result_reason";
+     turn_started_at, result_winner, result_reason, position_hashes";
 
 #[derive(Debug, sqlx::FromRow)]
 struct GameRow {
@@ -29,6 +29,7 @@ struct GameRow {
     turn_started_at: DateTime<Utc>,
     result_winner: Option<String>,
     result_reason: Option<String>,
+    position_hashes: Vec<i64>,
 }
 
 fn decode_err(msg: &str) -> sqlx::Error {
@@ -86,6 +87,7 @@ impl GameRow {
                 turn_started_ms: self.turn_started_at.timestamp_millis(),
             },
             result,
+            position_hashes: self.position_hashes,
         })
     }
 }
@@ -100,8 +102,8 @@ pub async fn insert(conn: &mut PgConnection, game: &Game) -> Result<(), sqlx::Er
     sqlx::query(
         "INSERT INTO games (id, white_player_id, black_player_id, status, fen, side_to_move, \
          version, move_count, initial_time_ms, increment_ms, rated, white_time_ms, black_time_ms, \
-         turn_started_at, result_winner, result_reason) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+         turn_started_at, result_winner, result_reason, position_hashes) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
     )
     .bind(game.id)
     .bind(game.white_player_id)
@@ -119,6 +121,7 @@ pub async fn insert(conn: &mut PgConnection, game: &Game) -> Result<(), sqlx::Er
     .bind(turn_started)
     .bind(winner)
     .bind(reason)
+    .bind(&game.position_hashes)
     .execute(conn)
     .await?;
     Ok(())
@@ -159,7 +162,8 @@ pub async fn update(conn: &mut PgConnection, game: &Game) -> Result<(), sqlx::Er
     let affected = sqlx::query(
         "UPDATE games SET black_player_id = $2, status = $3, fen = $4, side_to_move = $5, \
          version = $6, move_count = $7, white_time_ms = $8, black_time_ms = $9, \
-         turn_started_at = $10, result_winner = $11, result_reason = $12, updated_at = now() \
+         turn_started_at = $10, result_winner = $11, result_reason = $12, \
+         position_hashes = $13, updated_at = now() \
          WHERE id = $1",
     )
     .bind(game.id)
@@ -174,6 +178,7 @@ pub async fn update(conn: &mut PgConnection, game: &Game) -> Result<(), sqlx::Er
     .bind(turn_started)
     .bind(winner)
     .bind(reason)
+    .bind(&game.position_hashes)
     .execute(conn)
     .await?
     .rows_affected();

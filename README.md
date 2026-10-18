@@ -33,18 +33,24 @@ end-to-end tests.
 - **Identity** — register, login, bearer sessions, password hashing (argon2id),
   constant-time verification, no user enumeration.
 - **Lobby** — create a game (time control), list open games, join a seat, read
-  any game.
+  any game, share an **invite link** (deep link to `/games/:id`, which survives
+  a login round-trip).
+- **Matchmaking** — enqueue for a time control; a background scheduler pairs two
+  waiting players and hands each of them the resulting game id exactly once.
 - **Live play over WebSocket** — subscribe, move, resign; server-validated
   legality, checkmate, stalemate and flag fall.
+- **Automatic draws** — fifty-move rule, threefold repetition and insufficient
+  material, all decided by the server from the authoritative position history.
 - **The hard parts, from day one** — optimistic versioning, idempotent
   commands, atomic persistence with a transactional outbox, resumable
   snapshots.
-- **Frontend** — auth, lobby, a board with clocks, move list, promotion picker,
-  spectator mode and automatic reconnection.
+- **Frontend** — auth, lobby with matchmaking and invite links, a board with
+  clocks, move list, promotion picker, spectator mode and automatic
+  reconnection.
 
-Deliberately **not** built yet: ratings/ELO calculation, matchmaking queue,
-tournaments, draw by repetition/insufficient material, PGN/SAN export, email,
-push, CI deployment. See [Known limitations](#known-limitations).
+Deliberately **not** built yet: ratings/ELO calculation, tournaments, PGN/SAN
+export, claim-based (rather than automatic) draws, email, push, CI deployment.
+See [Known limitations](#known-limitations).
 
 ---
 
@@ -191,6 +197,7 @@ All backend settings are environment variables (see `.env.example`):
 | `BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `DATABASE_MAX_CONNECTIONS` | `10` | Pool size |
 | `OUTBOX_POLL_INTERVAL_MS` | `200` | Outbox dispatch cadence |
+| `MATCHMAKING_INTERVAL_MS` | `1000` | Matchmaking pairing cadence |
 | `SESSION_TTL_DAYS` | `14` | Session lifetime |
 | `RUST_LOG` | `info` | `tracing` filter |
 
@@ -234,20 +241,26 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 3. **Game domain & persistence** — ✅ move pipeline, clocks, results, atomicity.
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
-5. **Platform growth** — ⏳ ratings, matchmaking, tournaments, draw detection.
+5. **Platform growth** — ⏳ ratings, tournaments; ✅ matchmaking, draw
+   detection.
 
 ## Known limitations
 
-- **Single replica.** The WS hub is in-process and the per-game lock is a
-  `tokio` mutex. Running multiple API instances requires swapping the publisher
-  for a shared broker and the lock for a database/broker-level one; the outbox
-  contract does not change.
-- **No draw by repetition / insufficient material** yet (explicit TODOs in
-  `domain/game.rs`); fifty-move and stalemate are handled.
+- **Single replica.** The WS hub is in-process, the per-game lock is a `tokio`
+  mutex and matchmaking runs a single scheduler in-process. Running multiple API
+  instances requires swapping the publisher for a shared broker and the lock for
+  a database/broker-level one; the pairing SQL already uses
+  `FOR UPDATE SKIP LOCKED`, so the scheduler itself is safe to run in parallel.
+  The outbox contract does not change.
+- **Draws are automatic, not claimed.** Threefold repetition and insufficient
+  material end the game as soon as the server detects them; FIDE would let the
+  player claim. Fifty-move and stalemate are also automatic.
 - **Bearer tokens in `localStorage`.** Fine for the skeleton; httpOnly cookies
   are the intended hardening step.
 - **No ratings yet** — the `ratings` module and tables are reserved but not
   populated.
+- **Matchmaking ignores rating.** Pairing is first-come-first-served per time
+  control; there is no skill-based search yet.
 - **Engine coverage** — `cozy-chess` covers standard chess only; variants are
   out of scope for now.
 

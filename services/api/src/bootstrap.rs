@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::infrastructure::clock::{ProcessClock, SharedClock};
 use crate::infrastructure::db;
 use crate::infrastructure::hub::Hub;
+use crate::infrastructure::matchmaking_scheduler;
 use crate::infrastructure::outbox_dispatcher;
 use crate::infrastructure::registry::GameRegistry;
 
@@ -58,11 +59,17 @@ pub fn spawn_outbox_dispatcher(state: AppState) -> JoinHandle<()> {
     outbox_dispatcher::spawn(state)
 }
 
+/// Start the matchmaking scheduler (single writer for pairings).
+pub fn spawn_matchmaking_scheduler(state: AppState) -> JoinHandle<()> {
+    matchmaking_scheduler::spawn(state)
+}
+
 /// Entry point used by `main`: connect, migrate, dispatch, serve.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let state = build_state(config).await?;
     run_migrations(&state.db).await?;
     spawn_outbox_dispatcher(state.clone());
+    spawn_matchmaking_scheduler(state.clone());
 
     let listener = TcpListener::bind(state.config.bind_addr).await?;
     let addr = listener.local_addr()?;

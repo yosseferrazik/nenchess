@@ -47,10 +47,17 @@ pub async fn insert_profile(conn: &mut PgConnection, user_id: Uuid) -> Result<()
 }
 
 pub async fn insert_rating(conn: &mut PgConnection, user_id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO ratings (user_id) VALUES ($1)")
-        .bind(user_id)
-        .execute(conn)
-        .await?;
+    // Seed every standard rating category so profiles are complete from day
+    // one. Ratings are still created lazily elsewhere, so this is only a
+    // convenience.
+    sqlx::query(
+        "INSERT INTO player_ratings (user_id, category) \
+         SELECT $1, category FROM unnest(ARRAY['bullet', 'blitz', 'rapid']) AS category \
+         ON CONFLICT (user_id, category) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

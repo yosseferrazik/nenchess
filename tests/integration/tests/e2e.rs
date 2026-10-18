@@ -13,8 +13,8 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use nenchess_integration::{spawn_server, ws_url};
 use protocol::{
-    AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameView, MoveInputDto, ServerMessage,
-    UserDto,
+    AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameView, MoveInputDto, ProfileDto,
+    ServerMessage, UserDto,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -66,6 +66,21 @@ impl Api {
         token: Option<&str>,
     ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
         let mut request = self.client.get(format!("{}{path}", self.base));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.json().await.unwrap_or(serde_json::Value::Null);
+        Ok((status, body))
+    }
+
+    async fn delete(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let mut request = self.client.delete(format!("{}{path}", self.base));
         if let Some(token) = token {
             request = request.bearer_auth(token);
         }
@@ -132,12 +147,87 @@ async fn get_game(api: &Api, token: &str, game_id: Uuid) -> anyhow::Result<GameV
     Ok(serde_json::from_value(body)?)
 }
 
+async fn get_profile(api: &Api, token: &str) -> anyhow::Result<ProfileDto> {
+    let (status, body) = api.get("/api/profile", Some(token)).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "profile expected 200, got {status}: {body}"
+    );
+    Ok(serde_json::from_value(body)?)
+}
+
+/// Create a game, choosing whether it is rated.
+async fn create_game_rated(
+    api: &Api,
+    token: &str,
+    initial_time_ms: i64,
+    rated: bool,
+) -> anyhow::Result<GameView> {
+    let (status, body) = api
+        .post(
+            "/api/games",
+            Some(token),
+            json!({ "initial_time_ms": initial_time_ms, "increment_ms": 0, "rated": rated }),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::CREATED,
+        "create game expected 201, got {status}: {body}"
+    );
+    Ok(serde_json::from_value(body)?)
+}
+
 fn error_code(body: &serde_json::Value) -> anyhow::Result<ErrorCode> {
     let code = body
         .get("code")
         .cloned()
         .context("error body without code")?;
     Ok(serde_json::from_value(code)?)
+}
+
+// ---------------------------------------------------------------------------
+// Matchmaking helpers
+// ---------------------------------------------------------------------------
+
+/// Enter the queue for a time control.
+async fn enqueue(
+    api: &Api,
+    token: &str,
+    initial_time_ms: i64,
+    increment_ms: i64,
+) -> anyhow::Result<()> {
+    let (status, body) = api
+        .post(
+            "/api/matchmaking",
+            Some(token),
+            json!({ "initial_time_ms": initial_time_ms, "increment_ms": increment_ms, "rated": false }),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "enqueue expected 200, got {status}: {body}"
+    );
+    anyhow::ensure!(
+        body["in_queue"] == json!(true),
+        "expected in_queue, got {body}"
+    );
+    Ok(())
+}
+
+/// Poll until the server reports a paired game. Returns its id.
+async fn await_match(api: &Api, token: &str) -> anyhow::Result<Uuid> {
+    for _ in 0..200 {
+        let (status, body) = api.get("/api/matchmaking", Some(token)).await?;
+        anyhow::ensure!(
+            status == StatusCode::OK,
+            "status expected 200, got {status}: {body}"
+        );
+        if let Some(id) = body.get("game_id").and_then(|value| value.as_str()) {
+            return Uuid::parse_str(id).context("game_id is not a uuid");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    bail!("no match produced within the polling window")
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +385,10 @@ async fn end_to_end() -> anyhow::Result<()> {
     concurrency_scenario(&api, &white, &black).await?;
     flag_scenario(&api, &white, &black).await?;
     checkmate_scenario(&api, &white, &black).await?;
+    repetition_scenario(&api, &white, &black).await?;
     spectator_scenario(&api, &white, &black).await?;
+    matchmaking_scenario(&api).await?;
+    ratings_scenario(&api).await?;
 
     Ok(())
 }
@@ -809,6 +902,229 @@ async fn spectator_scenario(
     let after = get_game(api, &white.token, game.id).await?;
     assert_eq!(after.version, 1);
     assert_eq!(after.move_count, 0);
+
+    Ok(())
+}
+
+/// A threefold repetition ends the game automatically as a draw, even though
+/// neither the fifty-move counter nor the material are involved.
+async fn repetition_scenario(
+    api: &Api,
+    white: &AuthResponse,
+    black: &AuthResponse,
+) -> anyhow::Result<()> {
+    let game = create_game(api, &white.token, 600_000).await?;
+    join_game(api, &black.token, game.id).await?;
+
+    let mut white_peer = Peer::connect(&api.base, &white.token, "white").await?;
+    let mut black_peer = Peer::connect(&api.base, &black.token, "black").await?;
+
+    // Knights shuffle out and back: the start position recurs three times.
+    let sequence = [
+        "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+    ];
+    let mut answer = None;
+    for (version, (index, uci)) in (1..).zip(sequence.iter().enumerate()) {
+        let mover = if index % 2 == 0 {
+            &mut white_peer
+        } else {
+            &mut black_peer
+        };
+        let command = move_command(game.id, version, uci);
+        mover.send(&command).await?;
+        let response = mover.response_to(command_id(&command)).await?;
+        expect_accepted(response.clone());
+        answer = Some(response);
+    }
+
+    let view = expect_state(answer.expect("last move response"));
+    assert_eq!(view.status, protocol::GameStatusDto::Finished);
+    assert_eq!(view.move_count, 8);
+    assert_eq!(view.version, 9);
+    let result = view.result.expect("result is set");
+    assert_eq!(result.winner, None, "a repetition is a draw, not a win");
+    assert_eq!(
+        result.reason,
+        protocol::ResultReasonDto::ThreefoldRepetition
+    );
+
+    // Further moves are refused.
+    let after = move_command(game.id, 9, "g1f3");
+    white_peer.send(&after).await?;
+    expect_error(
+        white_peer.response_to(command_id(&after)).await?,
+        ErrorCode::GameOver,
+    );
+
+    Ok(())
+}
+
+/// Matchmaking: two players looking for the same time control are paired into
+/// one already-active game, reported once to each of them.
+async fn matchmaking_scenario(api: &Api) -> anyhow::Result<()> {
+    let first = register(api, &TestUser::new("mm_a")).await?;
+    let second = register(api, &TestUser::new("mm_b")).await?;
+
+    enqueue(api, &first.token, 600_000, 0).await?;
+
+    // Alone in the queue: no game yet.
+    let (status, body) = api.get("/api/matchmaking", Some(&first.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["in_queue"], json!(true));
+    assert_eq!(body["game_id"], serde_json::Value::Null);
+
+    enqueue(api, &second.token, 600_000, 0).await?;
+
+    // The scheduler pairs them within a few ticks; both see the same game.
+    let first_game = await_match(api, &first.token).await?;
+    let second_game = await_match(api, &second.token).await?;
+    assert_eq!(first_game, second_game);
+
+    // The game exists, is already active and seats the two enqueuers.
+    let view = get_game(api, &first.token, first_game).await?;
+    assert_eq!(view.status, protocol::GameStatusDto::Active);
+    assert_eq!(
+        view.white.as_ref().map(|p| p.user_id),
+        Some(first.user.id),
+        "the earliest entrant plays white"
+    );
+    assert_eq!(view.black.as_ref().map(|p| p.user_id), Some(second.user.id));
+
+    // Consuming the match is one-shot: a later poll reports no queue entry.
+    let (_, body) = api.get("/api/matchmaking", Some(&first.token)).await?;
+    assert_eq!(body["in_queue"], json!(false));
+    let (_, body) = api.get("/api/matchmaking", Some(&second.token)).await?;
+    assert_eq!(body["in_queue"], json!(false));
+
+    // Two players with different time controls are never paired.
+    let third = register(api, &TestUser::new("mm_c")).await?;
+    enqueue(api, &third.token, 600_000, 0).await?;
+    enqueue(api, &first.token, 180_000, 2_000).await?;
+    let (status, body) = api.get("/api/matchmaking", Some(&third.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["in_queue"],
+        json!(true),
+        "a different time control must not match: {body}"
+    );
+
+    // Leaving the queue is idempotent and clears the entry.
+    let (status, body) = api.delete("/api/matchmaking", Some(&third.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["in_queue"], json!(false));
+    let (status, body) = api.delete("/api/matchmaking", Some(&third.token)).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["in_queue"], json!(false));
+
+    // Invalid time controls are rejected before entering the queue.
+    let fourth = register(api, &TestUser::new("mm_d")).await?;
+    let (status, body) = api
+        .post(
+            "/api/matchmaking",
+            Some(&fourth.token),
+            json!({ "initial_time_ms": 10, "increment_ms": 0, "rated": false }),
+        )
+        .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body)?, ErrorCode::BadRequest);
+
+    // Regression: `first` is still waiting alone for 3+2 (an entry nobody can be
+    // paired with). It must not block two newcomers looking for 10+0.
+    let fifth = register(api, &TestUser::new("mm_e")).await?;
+    let sixth = register(api, &TestUser::new("mm_f")).await?;
+    enqueue(api, &fifth.token, 600_000, 0).await?;
+    enqueue(api, &sixth.token, 600_000, 0).await?;
+    let fifth_game = await_match(api, &fifth.token).await?;
+    let sixth_game = await_match(api, &sixth.token).await?;
+    assert_eq!(
+        fifth_game, sixth_game,
+        "a lone 3+2 entry must not block a 10+0 pairing"
+    );
+
+    Ok(())
+}
+
+fn rapid_rating(profile: &ProfileDto) -> &protocol::RatingDto {
+    profile
+        .ratings
+        .iter()
+        .find(|rating| rating.category == "rapid")
+        .expect("the profile always lists a rapid rating")
+}
+
+/// Elo settlement: rated games move both ratings in the same transaction as
+/// the result; casual games leave them untouched.
+async fn ratings_scenario(api: &Api) -> anyhow::Result<()> {
+    let winner = register(api, &TestUser::new("elo_w")).await?;
+    let loser = register(api, &TestUser::new("elo_l")).await?;
+
+    // Every registered player starts with all three categories at the default.
+    let fresh = get_profile(api, &winner.token).await?;
+    assert_eq!(fresh.ratings.len(), 3);
+    for rating in &fresh.ratings {
+        assert_eq!(rating.rating, 1500, "{} starts at 1500", rating.category);
+        assert_eq!(rating.games_played, 0);
+    }
+
+    // A rated 10+0 game belongs to the `rapid` ladder.
+    let game = create_game_rated(api, &winner.token, 600_000, true).await?;
+    assert!(game.rated);
+    join_game(api, &loser.token, game.id).await?;
+
+    // Black resigns; white wins.
+    let mut peer = Peer::connect(&api.base, &loser.token, "elo-loser").await?;
+    let sub = subscribe(game.id);
+    peer.send(&sub).await?;
+    peer.response_to(command_id(&sub)).await?;
+    let resign = ClientMessage::GameResign {
+        command_id: Uuid::new_v4(),
+        game_id: game.id,
+    };
+    peer.send(&resign).await?;
+    let ended = peer.response_to(command_id(&resign)).await?;
+    let view = expect_state(ended);
+    assert_eq!(
+        view.result.expect("result is set").winner,
+        Some(protocol::ColorDto::White)
+    );
+
+    // The winner gained, the loser lost, and both played exactly one rapid game.
+    let winner_profile = get_profile(api, &winner.token).await?;
+    let loser_profile = get_profile(api, &loser.token).await?;
+    assert_eq!(rapid_rating(&winner_profile).rating, 1516);
+    assert_eq!(rapid_rating(&winner_profile).games_played, 1);
+    assert_eq!(rapid_rating(&loser_profile).rating, 1484);
+    assert_eq!(rapid_rating(&loser_profile).games_played, 1);
+    // Bullet and blitz remain untouched.
+    for rating in &winner_profile.ratings {
+        if rating.category != "rapid" {
+            assert_eq!(
+                rating.games_played, 0,
+                "{} must be untouched",
+                rating.category
+            );
+            assert_eq!(rating.rating, 1500);
+        }
+    }
+
+    // A casual game is never rated.
+    let casual = create_game_rated(api, &winner.token, 600_000, false).await?;
+    assert!(!casual.rated);
+    join_game(api, &loser.token, casual.id).await?;
+    let resign_casual = ClientMessage::GameResign {
+        command_id: Uuid::new_v4(),
+        game_id: casual.id,
+    };
+    peer.send(&resign_casual).await?;
+    peer.response_to(command_id(&resign_casual)).await?;
+
+    let after_casual = get_profile(api, &winner.token).await?;
+    assert_eq!(
+        rapid_rating(&after_casual).rating,
+        1516,
+        "a casual result must not move the rating"
+    );
+    assert_eq!(rapid_rating(&after_casual).games_played, 1);
 
     Ok(())
 }

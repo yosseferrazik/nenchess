@@ -3,8 +3,8 @@
 //! tested without a database, a socket or a framework.
 
 use game_core::{
-    starting_fen, validate_and_apply, Clock, Color, GameStatus as RulesStatus, MoveInput,
-    PieceKind, Square,
+    position_hash, starting_fen, validate_and_apply, Clock, Color, DrawKind,
+    GameStatus as RulesStatus, MoveInput, PieceKind, Square,
 };
 use uuid::Uuid;
 
@@ -46,6 +46,8 @@ pub enum ResultReason {
     Resignation,
     Flag,
     FiftyMove,
+    ThreefoldRepetition,
+    InsufficientMaterial,
     Abandonment,
 }
 
@@ -57,6 +59,8 @@ impl ResultReason {
             ResultReason::Resignation => "resignation",
             ResultReason::Flag => "flag",
             ResultReason::FiftyMove => "fifty_move",
+            ResultReason::ThreefoldRepetition => "threefold_repetition",
+            ResultReason::InsufficientMaterial => "insufficient_material",
             ResultReason::Abandonment => "abandonment",
         }
     }
@@ -68,6 +72,8 @@ impl ResultReason {
             "resignation" => Some(ResultReason::Resignation),
             "flag" => Some(ResultReason::Flag),
             "fifty_move" => Some(ResultReason::FiftyMove),
+            "threefold_repetition" => Some(ResultReason::ThreefoldRepetition),
+            "insufficient_material" => Some(ResultReason::InsufficientMaterial),
             "abandonment" => Some(ResultReason::Abandonment),
             _ => None,
         }
@@ -108,6 +114,10 @@ pub struct Game {
     pub rated: bool,
     pub clock: Clock,
     pub result: Option<GameResult>,
+    /// Zobrist hash of every position the game has been in, starting with the
+    /// initial position (see `game_core::position_hash`). Used to detect
+    /// threefold repetition; appended on every move.
+    pub position_hashes: Vec<i64>,
 }
 
 impl Game {
@@ -135,6 +145,7 @@ impl Game {
             rated,
             clock: Clock::new(initial_time_ms, increment_ms, Color::White, now_ms),
             result: None,
+            position_hashes: vec![position_hash_of(starting_fen())],
         }
     }
 
@@ -195,6 +206,12 @@ pub enum MoveOutcome {
     FlagExpired { game: Game },
 }
 
+/// Hash a position for repetition tracking. Positions always come from the
+/// rules kernel, so parsing cannot fail in practice.
+fn position_hash_of(fen: &str) -> i64 {
+    position_hash(fen).expect("positions produced by the rules kernel are valid FEN") as i64
+}
+
 /// Validate and apply a move.
 ///
 /// Checks performed in order: lifecycle → optimistic version →
@@ -247,8 +264,27 @@ pub fn apply_move(
     g.clock.apply_move(mover_color, now_ms);
     g.turn = g.clock.turn;
     g.fen = fen_after.clone();
+    g.position_hashes.push(position_hash_of(&fen_after));
+
+    // Threefold repetition: the position that has just occurred for the third
+    // time ends the game automatically (matching online-platform convention).
+    let repeated = {
+        let key = *g.position_hashes.last().expect("seeded with the start");
+        g.position_hashes
+            .iter()
+            .filter(|hash| **hash == key)
+            .count()
+            >= 3
+    };
 
     let ended = match rules_status {
+        RulesStatus::InProgress if repeated => {
+            g.result = Some(GameResult {
+                winner: None,
+                reason: ResultReason::ThreefoldRepetition,
+            });
+            true
+        }
         RulesStatus::InProgress => false,
         RulesStatus::Checkmate { loser } => {
             g.result = Some(GameResult {
@@ -264,10 +300,15 @@ pub fn apply_move(
             });
             true
         }
-        RulesStatus::Drawn => {
+        RulesStatus::Drawn(kind) => {
+            let reason = match kind {
+                DrawKind::FiftyMove => ResultReason::FiftyMove,
+                DrawKind::ThreefoldRepetition => ResultReason::ThreefoldRepetition,
+                DrawKind::InsufficientMaterial => ResultReason::InsufficientMaterial,
+            };
             g.result = Some(GameResult {
                 winner: None,
-                reason: ResultReason::FiftyMove,
+                reason,
             });
             true
         }
@@ -495,6 +536,72 @@ mod tests {
     }
 
     #[test]
+    fn threefold_repetition_ends_the_game() {
+        let now = 1_000;
+        let (mut game, white, black) = active_game(now);
+        // Knights shuffle out and back: the start position occurs three times.
+        let sequence = [
+            "g1f3", "g8f6", "f3g1", "f6g8", "g1f3", "g8f6", "f3g1", "f6g8",
+        ];
+        let mut mover = white;
+        let mut t = now;
+        for (i, uci) in sequence.iter().enumerate() {
+            let expected_version = i as i64 + 1;
+            let outcome =
+                apply_move(game, mover, expected_version, &mv(uci), t + 10).expect("move");
+            mover = if mover == white { black } else { white };
+            t += 10;
+            match outcome {
+                MoveOutcome::Applied { game: g, ended, .. } => {
+                    game = g;
+                    if i == sequence.len() - 1 {
+                        assert!(ended, "third occurrence must end the game");
+                        assert_eq!(game.status, GameStatus::Finished);
+                        assert_eq!(
+                            game.result,
+                            Some(GameResult {
+                                winner: None,
+                                reason: ResultReason::ThreefoldRepetition
+                            })
+                        );
+                    } else {
+                        assert!(!ended, "position {i} is not yet a threefold draw");
+                    }
+                }
+                _ => panic!("expected Applied"),
+            }
+        }
+    }
+
+    #[test]
+    fn insufficient_material_ends_the_game() {
+        let now = 1_000;
+        let white = Uuid::new_v4();
+        let black = Uuid::new_v4();
+        let created = Game::new(Uuid::new_v4(), white, 600_000, 0, false, now);
+        let mut game = join(created, black, now).expect("join");
+        // White king c2, black bishop c3, black king h8: Kxc3 leaves bare kings.
+        game.fen = "7k/8/8/8/8/2b5/2K5/8 w - - 0 1".to_string();
+        game.position_hashes = vec![position_hash_of(&game.fen)];
+
+        let outcome = apply_move(game, white, 1, &mv("c2c3"), now + 10).expect("capture");
+        match outcome {
+            MoveOutcome::Applied { game, ended, .. } => {
+                assert!(ended);
+                assert_eq!(game.status, GameStatus::Finished);
+                assert_eq!(
+                    game.result,
+                    Some(GameResult {
+                        winner: None,
+                        reason: ResultReason::InsufficientMaterial
+                    })
+                );
+            }
+            _ => panic!("expected Applied"),
+        }
+    }
+
+    #[test]
     fn resign_charges_running_clock_and_ends() {
         let now = 1_000;
         let (game, white, _black) = active_game(now);
@@ -527,6 +634,14 @@ mod tests {
         assert_eq!(
             ResultReason::from_db("fifty_move"),
             Some(ResultReason::FiftyMove)
+        );
+        assert_eq!(
+            ResultReason::from_db("threefold_repetition"),
+            Some(ResultReason::ThreefoldRepetition)
+        );
+        assert_eq!(
+            ResultReason::InsufficientMaterial.as_db(),
+            "insufficient_material"
         );
         assert_eq!(ResultReason::Flag.as_db(), "flag");
         assert_eq!(ResultReason::from_db("nope"), None);

@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-use cozy_chess::{Board, Move as EngineMove};
+use cozy_chess::{BitBoard, Board, Move as EngineMove, Piece, Square as EngineSquare};
 use thiserror::Error;
 
 use crate::types::{Color, PieceKind, Square};
@@ -64,6 +64,19 @@ impl MoveInput {
     }
 }
 
+/// Why a position is drawn by rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawKind {
+    /// Fifty moves have elapsed without a pawn move or a capture (also covers
+    /// the automatic seventy-five-move rule, since it is a superset).
+    FiftyMove,
+    /// The same position (pieces, side to move, castling rights and en-passant
+    /// availability) has occurred at least three times.
+    ThreefoldRepetition,
+    /// Neither side can possibly deliver checkmate (dead position).
+    InsufficientMaterial,
+}
+
 /// Terminal state of a game, derived from the position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameStatus {
@@ -73,9 +86,8 @@ pub enum GameStatus {
     Checkmate { loser: Color },
     /// Stalemate: no legal moves, not in check.
     Stalemate,
-    /// Drawn by rule (currently: fifty-move rule; repetition and insufficient
-    /// material are tracked as TODO in the roadmap).
-    Drawn,
+    /// Drawn by rule.
+    Drawn(DrawKind),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -123,37 +135,112 @@ pub fn legal_moves(fen: &str) -> Result<Vec<String>, MoveError> {
     Ok(moves)
 }
 
+/// A Zobrist hash that identifies a position for repetition detection: two
+/// positions share it if and only if they have the same pieces, side to move,
+/// castling rights and en-passant square.
+///
+/// It is deliberately *conservative*: including the en-passant square even when
+/// no capture is available can only make two truly equal positions look
+/// different (a missed repetition), never make two different positions look
+/// equal (a false draw).
+pub fn position_hash(fen: &str) -> Result<u64, MoveError> {
+    Ok(parse_fen(fen)?.hash())
+}
+
+/// Whether the position is dead: no sequence of legal moves can deliver
+/// checkmate. Covers bare kings, king + one minor piece, and king + bishop
+/// versus king + bishop with both bishops on the same colour complex.
+pub fn insufficient_material(fen: &str) -> Result<bool, MoveError> {
+    let board = parse_fen(fen)?;
+    Ok(insufficient_material_board(&board))
+}
+
 fn parse_fen(fen: &str) -> Result<Board, MoveError> {
     Board::from_fen(fen, false).map_err(|_| MoveError::InvalidFen(fen.to_string()))
 }
 
 fn position_status(board: &Board) -> Result<GameStatus, MoveError> {
-    use cozy_chess::GameStatus as EngineStatus;
-    Ok(match board.status() {
-        EngineStatus::Ongoing => GameStatus::InProgress,
-        EngineStatus::Won => GameStatus::Checkmate {
-            loser: map_color(board.side_to_move()),
-        },
-        EngineStatus::Drawn => {
-            let has_moves = {
-                let mut any = false;
-                board.generate_moves(|piece_moves| {
-                    if !piece_moves.is_empty() {
-                        any = true;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                any
-            };
-            if has_moves {
-                GameStatus::Drawn
+    // Checkmate and stalemate take precedence over every draw rule: a move that
+    // mates ends the game even if the half-move counter has also run out.
+    let has_moves = {
+        let mut any = false;
+        board.generate_moves(|piece_moves| {
+            if !piece_moves.is_empty() {
+                any = true;
+                true
             } else {
-                GameStatus::Stalemate
+                false
             }
-        }
-    })
+        });
+        any
+    };
+    if !has_moves {
+        return Ok(if board.checkers().is_empty() {
+            GameStatus::Stalemate
+        } else {
+            GameStatus::Checkmate {
+                loser: map_color(board.side_to_move()),
+            }
+        });
+    }
+    if board.halfmove_clock() >= 100 {
+        return Ok(GameStatus::Drawn(DrawKind::FiftyMove));
+    }
+    if insufficient_material_board(board) {
+        return Ok(GameStatus::Drawn(DrawKind::InsufficientMaterial));
+    }
+    Ok(GameStatus::InProgress)
+}
+
+/// Dead-position test on an already parsed board (see [`insufficient_material`]).
+fn insufficient_material_board(board: &Board) -> bool {
+    use cozy_chess::Color as EngineColor;
+
+    // A pawn, rook or queen can always, in principle, deliver mate.
+    if !board.pieces(Piece::Pawn).is_empty()
+        || !board.pieces(Piece::Rook).is_empty()
+        || !board.pieces(Piece::Queen).is_empty()
+    {
+        return false;
+    }
+
+    let white_bishops = board.colored_pieces(EngineColor::White, Piece::Bishop);
+    let black_bishops = board.colored_pieces(EngineColor::Black, Piece::Bishop);
+    let knights = board
+        .colored_pieces(EngineColor::White, Piece::Knight)
+        .len()
+        + board
+            .colored_pieces(EngineColor::Black, Piece::Knight)
+            .len();
+
+    match (white_bishops.len() + black_bishops.len(), knights) {
+        // Bare kings.
+        (0, 0) => true,
+        // King and a single minor piece cannot mate.
+        (1, 0) | (0, 1) => true,
+        // King + bishop versus king + bishop: drawn only when both bishops
+        // travel on the same colour complex.
+        (2, 0) => match (only_square(white_bishops), only_square(black_bishops)) {
+            (Some(a), Some(b)) => square_is_light(a) == square_is_light(b),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn only_square(set: BitBoard) -> Option<EngineSquare> {
+    let mut squares = set.into_iter();
+    match (squares.next(), squares.next()) {
+        (Some(square), None) => Some(square),
+        _ => None,
+    }
+}
+
+/// `true` for a light square, `false` for a dark one. `Square` is ordered
+/// rank-major (a1 = 0), so `file + rank` parity gives the square colour.
+fn square_is_light(square: EngineSquare) -> bool {
+    let index = square as usize;
+    ((index & 7) + (index >> 3)) % 2 == 1
 }
 
 fn map_color(color: cozy_chess::Color) -> Color {
@@ -209,6 +296,41 @@ mod tests {
     fn detects_stalemate() {
         let fen = "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1";
         assert_eq!(status(fen).unwrap(), GameStatus::Stalemate);
+    }
+
+    #[test]
+    fn detects_fifty_move_draw() {
+        // Half-move clock already at 100 with plenty of material on the board.
+        let fen = "7k/8/8/8/8/8/8/1K4R1 w - - 100 51";
+        assert_eq!(status(fen).unwrap(), GameStatus::Drawn(DrawKind::FiftyMove));
+    }
+
+    #[test]
+    fn detects_insufficient_material() {
+        assert!(insufficient_material("7k/8/8/8/8/8/8/K7 w - - 0 1").unwrap());
+        assert!(insufficient_material("7k/8/8/8/8/8/8/KB6 w - - 0 1").unwrap());
+        assert!(insufficient_material("7k/8/8/8/8/8/8/KN6 w - - 0 1").unwrap());
+        // Same-colour bishops: dead. b1 is dark, g8 is dark.
+        assert!(insufficient_material("6bk/8/8/8/8/8/8/1B5K w - - 0 1").unwrap());
+        // Opposite-colour bishops: still possible (with help) to mate.
+        assert!(!insufficient_material("7k/6b1/8/8/8/8/8/1B5K w - - 0 1").unwrap());
+        // A lone rook is enough material.
+        assert!(!insufficient_material("7k/8/8/8/8/8/8/1K4R1 w - - 0 1").unwrap());
+        assert_eq!(
+            status("7k/8/8/8/8/8/8/KB6 w - - 0 1").unwrap(),
+            GameStatus::Drawn(DrawKind::InsufficientMaterial)
+        );
+    }
+
+    #[test]
+    fn position_hash_ignores_counters_but_tracks_state() {
+        // Same pieces, side to move and rights; only the counters differ.
+        let a = "8/8/8/4k3/8/8/4P3/4K3 w - - 0 1";
+        let b = "8/8/8/4k3/8/8/4P3/4K3 w - - 7 40";
+        assert_eq!(position_hash(a).unwrap(), position_hash(b).unwrap());
+        // Different side to move is a different position.
+        let c = "8/8/8/4k3/8/8/4P3/4K3 b - - 0 1";
+        assert_ne!(position_hash(a).unwrap(), position_hash(c).unwrap());
     }
 
     #[test]

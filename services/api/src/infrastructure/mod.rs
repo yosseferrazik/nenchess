@@ -4,6 +4,7 @@
 pub mod clock;
 pub mod db;
 pub mod hub;
+pub mod matchmaking_scheduler;
 pub mod outbox_dispatcher;
 pub mod registry;
 pub mod repos;

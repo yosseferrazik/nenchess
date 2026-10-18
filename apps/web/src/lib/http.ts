@@ -8,6 +8,9 @@ import type {
   GameView,
   GamesResponse,
   LoginRequest,
+  MatchmakingRequest,
+  MatchmakingStatusDto,
+  ProfileDto,
   RegisterRequest,
   UserDto,
 } from './protocol';
@@ -23,7 +26,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions {
-  method?: 'GET' | 'POST';
+  method?: 'GET' | 'POST' | 'DELETE';
   token?: string;
   body?: unknown;
 }
@@ -67,4 +70,11 @@ export const http = {
   getGame: (token: string, gameId: string) => request<GameView>(`/games/${gameId}`, { token }),
   joinGame: (token: string, gameId: string) =>
     request<GameView>(`/games/${gameId}/join`, { method: 'POST', token, body: {} }),
+  enqueue: (token: string, body: MatchmakingRequest) =>
+    request<MatchmakingStatusDto>('/matchmaking', { method: 'POST', token, body }),
+  matchmakingStatus: (token: string) =>
+    request<MatchmakingStatusDto>('/matchmaking', { token }),
+  dequeue: (token: string) =>
+    request<MatchmakingStatusDto>('/matchmaking', { method: 'DELETE', token }),
+  profile: (token: string) => request<ProfileDto>('/profile', { token }),
 };

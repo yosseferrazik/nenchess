@@ -4,6 +4,8 @@
 //! from the Rust source of truth (`cargo test -p protocol` regenerates them
 //! into `src/lib/generated`).
 
+export type { ProfileDto } from './generated/ProfileDto';
+export type { RatingDto } from './generated/RatingDto';
 export type { AppliedMoveDto } from './generated/AppliedMoveDto';
 export type { AuthResponse } from './generated/AuthResponse';
 export type { ClockDto } from './generated/ClockDto';
@@ -17,6 +19,8 @@ export type { GameStatusDto } from './generated/GameStatusDto';
 export type { GameView } from './generated/GameView';
 export type { GamesResponse } from './generated/GamesResponse';
 export type { LoginRequest } from './generated/LoginRequest';
+export type { MatchmakingRequest } from './generated/MatchmakingRequest';
+export type { MatchmakingStatusDto } from './generated/MatchmakingStatusDto';
 export type { MoveDto } from './generated/MoveDto';
 export type { MoveInputDto } from './generated/MoveInputDto';
 export type { PieceKindDto } from './generated/PieceKindDto';

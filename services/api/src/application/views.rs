@@ -123,6 +123,8 @@ fn reason_dto(reason: ResultReason) -> ResultReasonDto {
         ResultReason::Resignation => ResultReasonDto::Resignation,
         ResultReason::Flag => ResultReasonDto::Flag,
         ResultReason::FiftyMove => ResultReasonDto::FiftyMove,
+        ResultReason::ThreefoldRepetition => ResultReasonDto::ThreefoldRepetition,
+        ResultReason::InsufficientMaterial => ResultReasonDto::InsufficientMaterial,
         ResultReason::Abandonment => ResultReasonDto::Abandonment,
     }
 }

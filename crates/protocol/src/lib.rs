@@ -124,6 +124,8 @@ pub enum ResultReasonDto {
     Resignation,
     Flag,
     FiftyMove,
+    ThreefoldRepetition,
+    InsufficientMaterial,
     Abandonment,
 }
 
@@ -229,6 +231,58 @@ pub fn default_initial_time_ms() -> i64 {
 #[ts(export)]
 pub struct GamesResponse {
     pub games: Vec<GameView>,
+}
+
+// ---------------------------------------------------------------------------
+// Matchmaking
+// ---------------------------------------------------------------------------
+
+/// Request to enter (or re-enter) the matchmaking queue. Two players paired
+/// share a time control; the colour is decided by the scheduler.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MatchmakingRequest {
+    /// Default: 10 minutes.
+    #[serde(default = "default_initial_time_ms")]
+    #[ts(type = "number")]
+    pub initial_time_ms: i64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub increment_ms: i64,
+    #[serde(default)]
+    pub rated: bool,
+}
+
+/// The caller's current matchmaking state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct MatchmakingStatusDto {
+    /// Whether the caller is waiting in the queue (unmatched).
+    #[serde(default)]
+    pub in_queue: bool,
+    /// Set once an opponent was found: the game to open. The queue entry is
+    /// consumed when this is returned.
+    pub game_id: Option<Uuid>,
+    /// When the caller entered the queue, for progress UIs.
+    #[ts(type = "number")]
+    pub enqueued_at_ms: Option<i64>,
+}
+
+/// Per-category rating snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RatingDto {
+    pub category: String,
+    pub rating: i32,
+    pub games_played: i32,
+}
+
+/// Public profile with ratings across standard categories.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ProfileDto {
+    pub user: UserDto,
+    pub ratings: Vec<RatingDto>,
 }
 
 // ---------------------------------------------------------------------------

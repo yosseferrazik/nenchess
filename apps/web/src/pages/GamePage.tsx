@@ -1,18 +1,40 @@
+import { useState } from 'react';
+
 import { useGameSocket } from '../lib/ws';
 import { Board } from '../components/Board';
 import { Clock } from '../components/Clock';
 import { useAuth } from '../lib/auth';
-import type { GameView } from '../lib/protocol';
+import { copyInviteLink } from '../lib/invite';
+import type { GameView, ResultReasonDto } from '../lib/protocol';
+
+/** Human-readable reason, shown to spectators and to the players. */
+const REASON_LABELS: Record<ResultReasonDto, string> = {
+  checkmate: 'jaque mate',
+  stalemate: 'ahogado',
+  resignation: 'abandono',
+  flag: 'caída de bandera (tiempo)',
+  fifty_move: 'regla de 50 movimientos',
+  threefold_repetition: 'triple repetición',
+  insufficient_material: 'material insuficiente',
+  abandonment: 'abandono por ausencia',
+};
 
 export function GamePage({ gameId }: { gameId: string }) {
   const { session } = useAuth();
   const { state, move, resign, clearError } = useGameSocket(gameId);
   const { game } = state;
+  const [linkState, setLinkState] = useState<'idle' | 'copied' | 'failed'>('idle');
 
   const myColor = colorOf(game, session?.user.id ?? null);
   const lastMove = lastMoveOf(game);
   const interactive =
     game?.status === 'active' && myColor !== null && game.turn === myColor && !state.pending;
+
+  const copyLink = async () => {
+    const ok = await copyInviteLink(gameId);
+    setLinkState(ok ? 'copied' : 'failed');
+    window.setTimeout(() => setLinkState('idle'), 2_000);
+  };
 
   return (
     <section className="game">
@@ -38,13 +60,14 @@ export function GamePage({ gameId }: { gameId: string }) {
             <Board
               fen={game.fen}
               orientation={myColor === 'black' ? 'black' : 'white'}
+              myColor={myColor}
               interactive={interactive}
               lastMove={lastMove}
               onMove={(from, to, promotion) => {
-                void move(from, to, promotion).catch((error: Error) => {
-                  /* surfaced through state.lastError when the server answers */
-                  console.warn(error.message);
-                });
+                // Server errors arrive as `error` frames and are surfaced via
+                // `state.lastError`; a transport failure just means the socket
+                // will reconnect and resubscribe.
+                void move(from, to, promotion).catch(() => undefined);
               }}
             />
             <PlayerRow game={game} side="white" fallback={myColor === null ? '(asiento vacío)' : ''} />
@@ -52,6 +75,13 @@ export function GamePage({ gameId }: { gameId: string }) {
 
           <aside className="side-panel">
             <StatusPanel game={game} myColor={myColor} />
+            <button type="button" className="secondary" onClick={() => void copyLink()}>
+              {linkState === 'copied'
+                ? '¡enlace copiado!'
+                : linkState === 'failed'
+                  ? 'no se pudo copiar'
+                  : 'Copiar enlace de invitación'}
+            </button>
             {myColor !== null && game.status === 'active' ? (
               <button type="button" className="danger" onClick={() => { if (confirm('¿Abandonar la partida?')) void resign(); }}>
                 Abandonar
@@ -103,7 +133,9 @@ function StatusPanel({ game, myColor }: { game: GameView; myColor: 'white' | 'bl
     return (
       <div className="status-panel">
         <strong>Esperando rival</strong>
-        <p className="muted small">Comparte el id de la partida para que se unan.</p>
+        <p className="muted small">
+          Comparte el enlace de invitación o el id de la partida para que se unan.
+        </p>
       </div>
     );
   }
@@ -114,7 +146,9 @@ function StatusPanel({ game, myColor }: { game: GameView; myColor: 'white' | 'bl
     return (
       <div className="status-panel">
         <strong>{winner ? `Ganó ${winner}` : 'Tablas'}</strong>
-        <p className="muted small">Motivo: {result?.reason ?? 'desconocido'}</p>
+        <p className="muted small">
+          Motivo: {result ? (REASON_LABELS[result.reason] ?? result.reason) : 'desconocido'}
+        </p>
       </div>
     );
   }

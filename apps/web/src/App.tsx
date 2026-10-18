@@ -1,5 +1,5 @@
 import type { ReactElement } from 'react';
-import { Link, Navigate, Route, Routes, useParams } from 'react-router-dom';
+import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom';
 
 import { useAuth } from './lib/auth';
 import { AuthPage } from './pages/AuthPage';
@@ -10,8 +10,11 @@ import { TournamentsPage } from './pages/TournamentsPage';
 
 function Protected({ children }: { children: ReactElement }) {
   const { session, checking } = useAuth();
+  const location = useLocation();
   if (checking) return <p className="muted">Verificando sesión…</p>;
-  return session ? children : <Navigate to="/auth" replace />;
+  // Remember where the visitor was heading so an invite link survives the
+  // login/registration round-trip.
+  return session ? children : <Navigate to="/auth" replace state={{ from: location.pathname }} />;
 }
 
 function GameRoute() {

@@ -8,7 +8,10 @@
 //! * The test database (`nenchess_test`) is dropped and recreated on every run.
 
 use anyhow::Context;
-use nenchess_api::{build_router, build_state, run_migrations, spawn_outbox_dispatcher, Config};
+use nenchess_api::{
+    build_router, build_state, run_migrations, spawn_matchmaking_scheduler,
+    spawn_outbox_dispatcher, Config,
+};
 
 /// Connection URL of the maintenance database used to (re)create the test database.
 pub fn admin_url() -> String {
@@ -52,6 +55,7 @@ pub async fn spawn_server() -> anyhow::Result<String> {
         bind_addr: "127.0.0.1:0".parse()?,
         database_max_connections: 5,
         outbox_poll_interval_ms: 50,
+        matchmaking_interval_ms: 50,
         session_ttl_days: 1,
         rust_log: "info".to_string(),
     };
@@ -59,6 +63,7 @@ pub async fn spawn_server() -> anyhow::Result<String> {
     let state = build_state(config).await?;
     run_migrations(&state.db).await?;
     spawn_outbox_dispatcher(state.clone());
+    spawn_matchmaking_scheduler(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
