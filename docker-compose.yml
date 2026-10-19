@@ -23,8 +23,11 @@ services:
       DATABASE_URL: postgres://nenchess:nenchess@postgres:5432/nenchess
       BIND_ADDR: 0.0.0.0:8080
       RUST_LOG: info
-    ports:
-      - "8080:8080"
+      # Only nginx reaches the API, so proxy headers identify the real client
+      # for the auth rate limiter. The port is intentionally NOT published:
+      # exposing it would let a client spoof X-Real-IP to bypass rate limits.
+      TRUST_PROXY_HEADERS: "true"
+      # ALLOWED_ORIGINS: "https://your.domain"   # when not browsing via localhost
     depends_on:
       postgres:
         condition: service_healthy

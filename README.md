@@ -21,6 +21,7 @@ end-to-end tests.
 - [Clocks and results](#clocks-and-results)
 - [The contract is Rust](#the-contract-is-rust)
 - [Configuration](#configuration)
+- [Security and operations](#security-and-operations)
 - [Testing](#testing)
 - [Decisions](#decisions)
 - [Roadmap](#roadmap)
@@ -30,8 +31,9 @@ end-to-end tests.
 
 ## What works today
 
-- **Identity** — register, login, bearer sessions, password hashing (argon2id),
-  constant-time verification, no user enumeration.
+- **Identity** — register, login, sessions as `HttpOnly; SameSite=Lax` cookies
+  (bearer tokens for API clients), logout with server-side revocation, password
+  hashing (argon2id), constant-time verification, no user enumeration.
 - **Lobby** — create a game (time control), list open games, join a seat, read
   any game, share an **invite link** (deep link to `/games/:id`, which survives
   a login round-trip).
@@ -56,7 +58,7 @@ end-to-end tests.
   reconnection, and tournament create/join/start with live standings.
 
 Deliberately **not** built yet: PGN/SAN export, claim-based (rather than
-automatic) draws, skill-based matchmaking, httpOnly cookie auth, email, push,
+automatic) draws, skill-based matchmaking, email, push,
 CI deployment. See [Known limitations](#known-limitations).
 
 ---
@@ -117,9 +119,12 @@ infra/docker/             Dockerfiles + nginx config
 
 ```bash
 docker compose up --build
-# API  → http://localhost:8080/health
-# Web  → http://localhost:8081
+# Web  → http://localhost:8081  (nginx also proxies the ops endpoints)
+# API  → http://localhost:8081/health, /livez, /readyz, /metrics
 ```
+
+The API container's port is deliberately not published: only nginx reaches it,
+which is what makes the trusted-proxy rate-limit keying (below) spoof-proof.
 
 ### Local development
 
@@ -204,11 +209,51 @@ All backend settings are environment variables (see `.env.example`):
 | `DATABASE_MAX_CONNECTIONS` | `10` | Pool size |
 | `OUTBOX_POLL_INTERVAL_MS` | `200` | Outbox dispatch cadence |
 | `MATCHMAKING_INTERVAL_MS` | `1000` | Matchmaking pairing cadence |
-| `SESSION_TTL_DAYS` | `14` | Session lifetime |
+| `SESSION_TTL_DAYS` | `14` | Session lifetime (cookie `Max-Age` too) |
 | `RUST_LOG` | `info` | `tracing` filter |
+| `RATE_LIMIT_AUTH_PER_MINUTE` | `30` | Register + login per client IP (0 = off) |
+| `RATE_LIMIT_API_PER_MINUTE` | `0` | Authenticated API calls per user (0 = off) |
+| `RATE_LIMIT_WS_PER_MINUTE` | `120` | WebSocket commands per connection (0 = off) |
+| `COOKIE_SECURE` | `false` | Add `Secure` to session cookies (HTTPS) |
+| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Real-IP`/`X-Forwarded-For` (behind nginx) |
+| `ALLOWED_ORIGINS` | localhost:5173/8081 (and 127.0.0.1) | Extra `Origin` values accepted on cookie CSRF checks (CSV) |
 
 Validation bounds: `initial_time_ms` 1 000–3 600 000, `increment_ms` 0–60 000,
 username 3–20 chars `[A-Za-z0-9_]`, password 8–128 chars.
+
+## Security and operations
+
+**Sessions.** Login/registration set an `HttpOnly; SameSite=Lax` session
+cookie; the SPA never sees the token (only display data lands in
+`localStorage`, revalidated against `/api/auth/me` on page load). API clients
+keep using `Authorization: Bearer …`, and the WebSocket upgrade accepts either
+`?token=` or the cookie. `POST /api/auth/logout` revokes the session
+server-side and clears the cookie.
+
+**CSRF.** Cookie-authenticated unsafe requests must prove same-origin: modern
+browsers are held to `Sec-Fetch-Site: same-origin|none`; without it the
+`Origin` must be in `ALLOWED_ORIGINS` or match the request `Host`. Bearer
+requests are exempt, and `SameSite=Lax` is the outer layer.
+
+**Rate limits.** Fixed windows, per process (zero dependencies): Argon2-backed
+register/login per client IP (429 + `Retry-After`), optional authenticated API
+budget per user, and a per-WebSocket-connection command budget. Behind nginx
+set `TRUST_PROXY_HEADERS=true` — and keep the API port unpublished so headers
+can't be spoofed.
+
+**Probes and metrics.**
+
+```bash
+curl http://127.0.0.1:8080/livez   # dev: API direct (Docker: http://localhost:8081/livez)
+curl http://127.0.0.1:8080/readyz   # 200/503 — DB SELECT 1 under a 2 s budget
+curl http://127.0.0.1:8080/metrics  # Prometheus text: HTTP by route/status class,
+                                    # WS gauges, moves, outbox, auth, rate limits
+curl http://127.0.0.1:8080/health   # legacy combined probe, unchanged
+```
+
+Every response carries `x-request-id` (adopted if you send one, generated
+otherwise) and each request runs inside a span with the same id, so one id
+correlates the proxy log, nginx log and API logs.
 
 ## Testing
 
@@ -218,7 +263,8 @@ cargo test --workspace
 
 # End-to-end: spawns the real server against a `nenchess_test` database and
 # drives it over HTTP and WebSocket (idempotency, version conflicts, races,
-# flag fall, resignation, spectators)
+# flag fall, resignation, spectators, tournaments, ops probes, cookie/CSRF
+# lifecycle, rate-limit 429)
 cargo test -p nenchess-integration --test e2e -- --nocapture
 
 npm run lint && npm run typecheck && npm run build
@@ -242,6 +288,9 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 - **0003** — Platform growth: per-category Elo settled with the game, a single
   scheduler for matchmaking, and round-robin tournaments reusing the game
   engine.
+- **0004** — Hardening: `HttpOnly` cookie sessions with layered CSRF checks,
+  dependency-free fixed-window rate limits, and probes/Prometheus metrics with
+  request-id correlation.
 
 ## Roadmap
 
@@ -256,16 +305,15 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 ## Known limitations
 
 - **Single replica.** The WS hub is in-process, the per-game lock is a `tokio`
-  mutex and matchmaking runs a single scheduler in-process. Running multiple API
-  instances requires swapping the publisher for a shared broker and the lock for
-  a database/broker-level one; the pairing SQL already uses
-  `FOR UPDATE SKIP LOCKED`, so the scheduler itself is safe to run in parallel.
-  The outbox contract does not change.
+  mutex and matchmaking runs a single scheduler in-process; rate limiters and
+  metrics are per-process too, so replicas multiply the request budgets and
+  fragment `/metrics`. Running multiple API instances requires swapping the
+  publisher for a shared broker and the lock for a database/broker-level one;
+  the pairing SQL already uses `FOR UPDATE SKIP LOCKED`, so the scheduler
+  itself is safe to run in parallel. The outbox contract does not change.
 - **Draws are automatic, not claimed.** Threefold repetition and insufficient
   material end the game as soon as the server detects them; FIDE would let the
   player claim. Fifty-move and stalemate are also automatic.
-- **Bearer tokens in `localStorage`.** Fine for the skeleton; httpOnly cookies
-  are the intended hardening step.
 - **Matchmaking ignores rating.** Pairing is first-come-first-served per time
   control; there is no skill-based search yet.
 - **Engine coverage** — `cozy-chess` covers standard chess only; variants are
