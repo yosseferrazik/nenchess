@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use nenchess_integration::{spawn_server, ws_url};
+use nenchess_integration::{spawn_server, ws_url, ws_url_plain};
 use protocol::{
     AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameView, MoveInputDto, ProfileDto,
     ServerMessage, UserDto,
@@ -390,6 +390,11 @@ async fn end_to_end() -> anyhow::Result<()> {
     matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
     tournament_scenario(&api).await?;
+    ops_scenarios(&api).await?;
+    cookie_scenarios(&api).await?;
+    // Must run last: it deliberately exhausts the per-IP auth budget that
+    // every earlier scenario (and this one) has been spending from.
+    auth_rate_limit_scenario(&api).await?;
 
     Ok(())
 }
@@ -1529,4 +1534,354 @@ async fn tournament_scenario(api: &Api) -> anyhow::Result<()> {
 
 fn command_id_of(command: &ClientMessage) -> Uuid {
     command_id(command)
+}
+
+// ---------------------------------------------------------------------------
+// Ops endpoints, cookie sessions and rate limiting
+// ---------------------------------------------------------------------------
+
+/// Liveness/readiness/metrics probes and request-id propagation.
+async fn ops_scenarios(api: &Api) -> anyhow::Result<()> {
+    for path in ["/livez", "/readyz", "/health"] {
+        let response = api.client.get(format!("{}{path}", api.base)).send().await?;
+        anyhow::ensure!(
+            response.status() == StatusCode::OK,
+            "{path} expected 200, got {}",
+            response.status()
+        );
+    }
+
+    // A supplied request id is adopted and echoed…
+    let response = api
+        .client
+        .get(format!("{}/livez", api.base))
+        .header("x-request-id", "e2e-fixed-0001")
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            == Some("e2e-fixed-0001"),
+        "x-request-id must be echoed"
+    );
+
+    // …and a generated one is attached otherwise.
+    let response = api.client.get(format!("{}/livez", api.base)).send().await?;
+    let generated = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .context("generated x-request-id must be present")?;
+    anyhow::ensure!(!generated.is_empty(), "generated x-request-id is empty");
+
+    // Prometheus exposition with bounded route labels.
+    let response = api
+        .client
+        .get(format!("{}/metrics", api.base))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status() == StatusCode::OK,
+        "/metrics expected 200, got {}",
+        response.status()
+    );
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    anyhow::ensure!(
+        content_type.starts_with("text/plain"),
+        "unexpected /metrics content type {content_type}"
+    );
+    let text = response.text().await?;
+    for expected in [
+        "nenchess_up 1",
+        "nenchess_build_info{version=",
+        "nenchess_http_requests_total{method=\"GET\",route=\"/livez\",status=\"2xx\"}",
+        "nenchess_auth_logins_total",
+        "nenchess_moves_committed",
+        "nenchess_outbox_published",
+    ] {
+        anyhow::ensure!(
+            text.contains(expected),
+            "/metrics is missing {expected:?}:\n{text}"
+        );
+    }
+    Ok(())
+}
+
+/// HttpOnly cookie sessions: login sets the cookie, it authenticates REST
+/// *and* the WebSocket handshake, cookie-authenticated unsafe requests are
+/// held to the CSRF rules, and logout revokes it server-side.
+async fn cookie_scenarios(api: &Api) -> anyhow::Result<()> {
+    let user = TestUser::new("cookie");
+    let client = reqwest::Client::new();
+
+    // Register: the response carries an HttpOnly, SameSite=Lax cookie.
+    let response = client
+        .post(format!("{}/api/auth/register", api.base))
+        .json(&json!({ "username": user.username, "password": user.password }))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status() == StatusCode::CREATED,
+        "register expected 201, got {}",
+        response.status()
+    );
+    let set_cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("nenchess_session="))
+        .context("register did not set the session cookie")?
+        .to_string();
+    anyhow::ensure!(
+        set_cookie.contains("HttpOnly"),
+        "session cookie must be HttpOnly: {set_cookie}"
+    );
+    anyhow::ensure!(
+        set_cookie.contains("SameSite=Lax"),
+        "session cookie must be SameSite=Lax: {set_cookie}"
+    );
+    let token = set_cookie
+        .split(';')
+        .next()
+        .and_then(|pair| pair.strip_prefix("nenchess_session="))
+        .context("cookie value missing")?;
+    let cookie = format!("nenchess_session={token}");
+
+    // The cookie alone authenticates REST.
+    let me = client
+        .get(format!("{}/api/auth/me", api.base))
+        .header("cookie", &cookie)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        me.status() == StatusCode::OK,
+        "cookie must authenticate /auth/me, got {}",
+        me.status()
+    );
+    let me_body: UserDto = me.json().await?;
+    anyhow::ensure!(
+        me_body.username == user.username,
+        "cookie authenticated the wrong user"
+    );
+
+    let game = json!({ "initial_time_ms": 60_000, "increment_ms": 0, "rated": false });
+
+    // CSRF: a cross-site cookie POST is rejected…
+    let cross = client
+        .post(format!("{}/api/games", api.base))
+        .header("cookie", &cookie)
+        .header("sec-fetch-site", "cross-site")
+        .json(&game)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        cross.status() == StatusCode::FORBIDDEN,
+        "cross-site cookie POST must be 403, got {}",
+        cross.status()
+    );
+    let cross_body: serde_json::Value = cross.json().await?;
+    anyhow::ensure!(
+        cross_body["code"] == "forbidden",
+        "unexpected error body {cross_body}"
+    );
+
+    // …so is a hostile Origin (older browsers without fetch metadata)…
+    let evil = client
+        .post(format!("{}/api/games", api.base))
+        .header("cookie", &cookie)
+        .header("origin", "https://evil.example")
+        .json(&game)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        evil.status() == StatusCode::FORBIDDEN,
+        "cross-origin cookie POST must be 403, got {}",
+        evil.status()
+    );
+
+    // …while the real browser posture (Sec-Fetch-Site: same-origin) works…
+    let same = client
+        .post(format!("{}/api/games", api.base))
+        .header("cookie", &cookie)
+        .header("sec-fetch-site", "same-origin")
+        .json(&game)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        same.status() == StatusCode::CREATED,
+        "same-origin cookie POST expected 201, got {}",
+        same.status()
+    );
+
+    // …and so does an Origin that matches the request host.
+    let origin_match = client
+        .post(format!("{}/api/games", api.base))
+        .header("cookie", &cookie)
+        .header("origin", &api.base)
+        .json(&game)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        origin_match.status() == StatusCode::CREATED,
+        "host-matching Origin expected 201, got {}",
+        origin_match.status()
+    );
+
+    // Bearer requests are exempt from the CSRF rules (no cookie involved).
+    let bearer = client
+        .post(format!("{}/api/games", api.base))
+        .header("authorization", format!("Bearer {}", cookie_token(&cookie)))
+        .header("sec-fetch-site", "cross-site")
+        .json(&game)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        bearer.status() == StatusCode::CREATED,
+        "a bearer POST with cross-site fetch metadata must still work, got {}",
+        bearer.status()
+    );
+
+    // The WebSocket handshake authenticates with the cookie alone.
+    let mut socket = connect_ws_cookie(&api.base, &cookie).await?;
+    let ping = ClientMessage::Ping {
+        command_id: Uuid::new_v4(),
+    };
+    socket
+        .send(Message::Text(serde_json::to_string(&ping)?.into()))
+        .await
+        .context("could not send ping over the cookie websocket")?;
+    let mut pong = false;
+    for _ in 0..10 {
+        let next = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("cookie websocket timed out"))?;
+        let Some(frame) = next else {
+            bail!("cookie websocket closed before pong");
+        };
+        let frame = frame?;
+        if let Message::Text(text) = frame {
+            if matches!(
+                serde_json::from_str::<ServerMessage>(text.as_str())?,
+                ServerMessage::Pong { .. }
+            ) {
+                pong = true;
+                break;
+            }
+        }
+    }
+    anyhow::ensure!(pong, "no Pong over the cookie-authenticated websocket");
+    let _ = socket.close(None).await;
+
+    // Logout revokes the session server-side and expires the cookie.
+    let logout = client
+        .post(format!("{}/api/auth/logout", api.base))
+        .header("cookie", &cookie)
+        .header("sec-fetch-site", "same-origin")
+        .send()
+        .await?;
+    anyhow::ensure!(
+        logout.status() == StatusCode::NO_CONTENT,
+        "logout expected 204, got {}",
+        logout.status()
+    );
+    let cleared = logout
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    anyhow::ensure!(
+        cleared.contains("Max-Age=0"),
+        "logout must expire the cookie: {cleared}"
+    );
+
+    let after = client
+        .get(format!("{}/api/auth/me", api.base))
+        .header("cookie", &cookie)
+        .send()
+        .await?;
+    anyhow::ensure!(
+        after.status() == StatusCode::UNAUTHORIZED,
+        "a revoked cookie must be 401, got {}",
+        after.status()
+    );
+    let dead = connect_ws_cookie(&api.base, &cookie).await;
+    anyhow::ensure!(dead.is_err(), "a revoked cookie must not open a websocket");
+
+    Ok(())
+}
+
+fn cookie_token(cookie: &str) -> String {
+    cookie
+        .strip_prefix("nenchess_session=")
+        .expect("cookie header shape")
+        .to_string()
+}
+
+/// Open `/ws` without a query token, authenticating with the cookie header
+/// exactly as a browser does on a same-origin handshake.
+async fn connect_ws_cookie(base: &str, cookie: &str) -> anyhow::Result<Ws> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = ws_url_plain(base).into_client_request()?;
+    let value = cookie
+        .parse()
+        .map_err(|err| anyhow::anyhow!("cookie header value: {err}"))?;
+    request.headers_mut().insert("cookie", value);
+    let (socket, _) = connect_async(request)
+        .await
+        .context("cookie websocket handshake failed")?;
+    Ok(socket)
+}
+
+/// Deliberately exhausts the per-IP auth budget with invalid logins.
+///
+/// Runs last on purpose: every earlier scenario shares the same limiter
+/// window, so the exact attempt count of the first 429 varies with test
+/// timing; only its arrival is asserted.
+async fn auth_rate_limit_scenario(api: &Api) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    // Unknown user: the401 path is a cheap indexed lookup, no Argon2.
+    let body = json!({ "username": "no_such_rate_limit_user", "password": "wrong-password" });
+
+    let mut limited: Option<(usize, String, serde_json::Value)> = None;
+    for attempt in 0..120 {
+        let response = client
+            .post(format!("{}/api/auth/login", api.base))
+            .json(&body)
+            .send()
+            .await?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let payload: serde_json::Value = response.json().await?;
+            limited = Some((attempt, retry_after, payload));
+            break;
+        }
+        anyhow::ensure!(
+            response.status() == StatusCode::UNAUTHORIZED,
+            "unexpected login status {} on attempt {attempt}",
+            response.status()
+        );
+    }
+
+    let (attempt, retry_after, payload) =
+        limited.context("no 429 received after 120 extra login attempts")?;
+    anyhow::ensure!(!retry_after.is_empty(), "a 429 must carry Retry-After");
+    anyhow::ensure!(
+        payload["code"] == "rate_limited",
+        "unexpected 429 body {payload}"
+    );
+    eprintln!("auth rate limit kicked in after {attempt} extra attempts");
+    Ok(())
 }
