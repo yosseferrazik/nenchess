@@ -16,7 +16,7 @@ use crate::bootstrap::AppState;
 use crate::domain::{self, GameStatus, MoveOutcome};
 use crate::error::ApiError;
 use crate::infrastructure::repos::{games as games_repo, idempotency, outbox};
-use crate::modules::ratings;
+use crate::modules::{ratings, tournaments};
 
 type DbTx<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 
@@ -66,10 +66,12 @@ pub async fn submit_move(
         } => {
             games_repo::update(&mut tx, &game).await?;
             games_repo::insert_move(&mut tx, game.id, &applied, &fen_after).await?;
-            // A rated game that ended on this move settles Elo in the same
-            // transaction as the result.
+            // A game that ended on this move settles its consequences — Elo
+            // and any tournament pairing — in the same transaction as the
+            // result.
             if game.status == GameStatus::Finished {
                 ratings::settle(&mut tx, &game).await?;
+                tournaments::settle_game(&mut tx, &game).await?;
             }
             let view = views::game_view(&mut tx, &game, now).await?;
             let applied_dto = protocol::AppliedMoveDto {
@@ -91,6 +93,7 @@ pub async fn submit_move(
             // without a new move record.
             games_repo::update(&mut tx, &game).await?;
             ratings::settle(&mut tx, &game).await?;
+            tournaments::settle_game(&mut tx, &game).await?;
             let view = views::game_view(&mut tx, &game, now).await?;
             ServerMessage::GameEnded {
                 command_id: Some(cmd.command_id),
@@ -147,6 +150,7 @@ pub async fn submit_resign(
     let finished = domain::resign(game, user_id, now)?;
     games_repo::update(&mut tx, &finished).await?;
     ratings::settle(&mut tx, &finished).await?;
+    tournaments::settle_game(&mut tx, &finished).await?;
     let view = views::game_view(&mut tx, &finished, now).await?;
     let message = ServerMessage::GameEnded {
         command_id: Some(cmd.command_id),
