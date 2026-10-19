@@ -29,7 +29,7 @@ export function LobbyPage() {
   const refresh = useCallback(async () => {
     if (!session) return;
     try {
-      const response = await http.listGames(session.token);
+      const response = await http.listGames();
       setGames(response.games);
       setError(null);
     } catch (problem) {
@@ -51,7 +51,7 @@ export function LobbyPage() {
 
     const poll = async () => {
       try {
-        const status = await http.matchmakingStatus(session.token);
+        const status = await http.matchmakingStatus();
         if (cancelled) return;
         if (status.game_id) {
           setSearching(false);
@@ -81,7 +81,7 @@ export function LobbyPage() {
     if (!session) return;
     setBusy(true);
     try {
-      const game = await http.createGame(session.token, {
+      const game = await http.createGame({
         initial_time_ms: TIME_CONTROLS[control].initial,
         increment_ms: TIME_CONTROLS[control].increment,
         rated,
@@ -99,7 +99,7 @@ export function LobbyPage() {
     setBusy(true);
     setError(null);
     try {
-      await http.enqueue(session.token, {
+      await http.enqueue({
         initial_time_ms: TIME_CONTROLS[control].initial,
         increment_ms: TIME_CONTROLS[control].increment,
         rated,
@@ -116,7 +116,7 @@ export function LobbyPage() {
   const cancelSearch = async () => {
     if (!session) return;
     try {
-      await http.dequeue(session.token);
+      await http.dequeue();
     } catch {
       // Leaving the queue is best-effort; the next status poll is authoritative.
     }
@@ -128,7 +128,7 @@ export function LobbyPage() {
     if (!session) return;
     setBusy(true);
     try {
-      await http.joinGame(session.token, gameId);
+      await http.joinGame(gameId);
       navigate(`/games/${gameId}`);
     } catch (problem) {
       setError(problem instanceof ApiError ? problem.message : 'no se pudo unir a la partida');

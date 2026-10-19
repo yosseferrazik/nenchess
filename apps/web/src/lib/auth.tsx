@@ -1,5 +1,9 @@
-//! Session context: the bearer token plus the authenticated user, persisted
-//! in `localStorage` and re-validated once per page load.
+//! Session context: the authenticated user, persisted in `localStorage` for
+//! instant paint and re-validated against `/auth/me` on every page load.
+//!
+//! The session *token* never reaches JavaScript: it lives in an `HttpOnly`
+//! cookie set by the server at login/registration. Only non-sensitive
+//! display data (username, expiry) is stored client-side.
 
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
@@ -8,14 +12,14 @@ import { http } from './http';
 import type { UserDto } from './protocol';
 
 export interface Session {
-  token: string;
   user: UserDto;
-  expiresAtMs: number;
+  /** Display-only expiry from the login response; null when unknown. */
+  expiresAtMs: number | null;
 }
 
 interface AuthContextValue {
   session: Session | null;
-  /** True while the stored session is being revalidated. */
+  /** True while a stored session is being revalidated. */
   checking: boolean;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
@@ -30,9 +34,12 @@ function loadStored(): Session | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as Session;
-    if (!parsed.token || !parsed.user) return null;
-    return parsed;
+    const parsed = JSON.parse(raw) as Partial<Session>;
+    if (!parsed.user) return null;
+    return {
+      user: parsed.user,
+      expiresAtMs: typeof parsed.expiresAtMs === 'number' ? parsed.expiresAtMs : null,
+    };
   } catch {
     return null;
   }
@@ -42,14 +49,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(loadStored);
   const [checking, setChecking] = useState(() => loadStored() !== null);
 
-  // Re-validate the stored token once: it may have expired server-side.
+  // Re-validate against the cookie: the stored session may have expired
+  // server-side, and a fresh login (e.g. another tab) also lands here.
   useEffect(() => {
-    if (!session) return;
     let cancelled = false;
     http
-      .me(session.token)
+      .me()
       .then((user) => {
-        if (!cancelled) setSession({ ...session, user });
+        if (!cancelled) setSession({ user, expiresAtMs: loadStored()?.expiresAtMs ?? null });
       })
       .catch(() => {
         if (!cancelled) {
@@ -63,7 +70,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const value = useMemo<AuthContextValue>(
@@ -73,7 +79,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       async login(username, password) {
         const response = await http.login({ username, password });
         const next: Session = {
-          token: response.token,
           user: response.user,
           expiresAtMs: response.expires_at_ms,
         };
@@ -83,7 +88,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       async register(username, password) {
         const response = await http.register({ username, password });
         const next: Session = {
-          token: response.token,
           user: response.user,
           expiresAtMs: response.expires_at_ms,
         };
@@ -91,8 +95,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setSession(next);
       },
       logout() {
+        // Clear locally at once; revoke server-side best-effort in the
+        // background (a failed revoke only leaves the cookie alive until
+        // it expires or the user logs in again).
         localStorage.removeItem(STORAGE_KEY);
         setSession(null);
+        void http.logout().catch(() => undefined);
       },
     }),
     [session, checking],

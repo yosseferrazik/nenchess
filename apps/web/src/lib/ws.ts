@@ -21,9 +21,11 @@ export interface LiveState {
   pending: boolean;
 }
 
-function wsUrl(token: string): string {
+function wsUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-  return `${protocol}${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+  // The session cookie rides along the same-origin handshake; no token in
+  // the URL (which would leak into logs and history).
+  return `${protocol}${window.location.host}/ws`;
 }
 
 function newCommandId(): string {
@@ -92,9 +94,9 @@ export function useGameSocket(gameId: string | null): {
   }, []);
 
   // Connection lifecycle: connect, re-subscribe on reopen, tear down on unmount.
+  const userId = session?.user.id;
   useEffect(() => {
-    const token = session?.token;
-    if (!token || !gameId) return;
+    if (!userId || !gameId) return;
     const pending = pendingRef.current;
     let disposed = false;
     let retry: number | undefined;
@@ -102,7 +104,7 @@ export function useGameSocket(gameId: string | null): {
     const connect = () => {
       if (disposed) return;
       setState((previous) => ({ ...previous, status: 'connecting' }));
-      const socket = new WebSocket(wsUrl(token));
+      const socket = new WebSocket(wsUrl());
       socketRef.current = socket;
       socket.onopen = () => {
         if (disposed) return;
@@ -146,7 +148,7 @@ export function useGameSocket(gameId: string | null): {
       socketRef.current = null;
       pending.clear();
     };
-  }, [session?.token, gameId, send, apply]);
+  }, [userId, gameId, send, apply]);
 
   const move = useCallback(
     async (from: string, to: string, promotion: PieceKindDto | null) => {

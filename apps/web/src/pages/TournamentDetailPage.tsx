@@ -24,7 +24,7 @@ export function TournamentDetailPage() {
     setLoading(true);
     setError(null);
     try {
-      const v = await http.getTournament(session.token, tournamentId);
+      const v = await http.getTournament(tournamentId);
       setView(v);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : 'no se pudo cargar el torneo');

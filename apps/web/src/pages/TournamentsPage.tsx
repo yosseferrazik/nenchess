@@ -31,7 +31,7 @@ export function TournamentsPage() {
     setLoading(true);
     setError(null);
     try {
-      const res = await http.listTournaments(session.token);
+      const res = await http.listTournaments();
       setTournaments(res.tournaments);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : 'no se pudieron cargar los torneos');
@@ -50,7 +50,7 @@ export function TournamentsPage() {
     e.preventDefault();
     setError(null);
     try {
-      await http.createTournament(session.token, form);
+      await http.createTournament(form);
       setForm({ ...form, name: '' });
       await load();
     } catch (err) {
@@ -58,11 +58,11 @@ export function TournamentsPage() {
     }
   };
 
-  const act = async (id: string, fn: (token: string, id: string) => Promise<unknown>) => {
+  const act = async (id: string, fn: (id: string) => Promise<unknown>) => {
     setBusyId(id);
     setError(null);
     try {
-      await fn(session.token, id);
+      await fn(id);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'la operación falló');

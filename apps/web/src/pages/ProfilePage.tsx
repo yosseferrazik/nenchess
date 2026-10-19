@@ -16,7 +16,7 @@ export function ProfilePage() {
       setLoading(true);
       setError(null);
       try {
-        const p = await http.profile(session.token);
+        const p = await http.profile();
         if (!cancelled) setProfile(p);
       } catch (e) {
         if (!cancelled) {
@@ -48,7 +48,9 @@ export function ProfilePage() {
             <code>{user.id}</code>
           </dd>
           <dt>Sesión expira</dt>
-          <dd>{new Date(session.expiresAtMs).toLocaleString()}</dd>
+          <dd>
+            {session.expiresAtMs ? new Date(session.expiresAtMs).toLocaleString() : '—'}
+          </dd>
         </dl>
       </div>
       <div className="panel">

@@ -11,13 +11,17 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
+      // `changeOrigin: false` keeps the browser's Host (localhost:5173)
+      // end-to-end, so the API's cookie-CSRF Origin-vs-Host check sees the
+      // real origin in development instead of the rewritten 127.0.0.1:8080.
       '/api': {
         target: 'http://127.0.0.1:8080',
-        changeOrigin: true,
+        changeOrigin: false,
       },
       '/ws': {
         target: 'ws://127.0.0.1:8080',
         ws: true,
+        changeOrigin: false,
       },
     },
   },
