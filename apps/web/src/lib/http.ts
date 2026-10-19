@@ -4,6 +4,7 @@
 import type {
   AuthResponse,
   CreateGameRequest,
+  CreateTournamentRequest,
   ErrorCode,
   GameView,
   GamesResponse,
@@ -12,6 +13,9 @@ import type {
   MatchmakingStatusDto,
   ProfileDto,
   RegisterRequest,
+  TournamentDto,
+  TournamentView,
+  TournamentsResponse,
   UserDto,
 } from './protocol';
 
@@ -77,4 +81,14 @@ export const http = {
   dequeue: (token: string) =>
     request<MatchmakingStatusDto>('/matchmaking', { method: 'DELETE', token }),
   profile: (token: string) => request<ProfileDto>('/profile', { token }),
+  listTournaments: (token: string) =>
+    request<TournamentsResponse>('/tournaments', { token }),
+  createTournament: (token: string, body: CreateTournamentRequest) =>
+    request<TournamentDto>('/tournaments', { method: 'POST', token, body }),
+  getTournament: (token: string, id: string) =>
+    request<TournamentView>(`/tournaments/${id}`, { token }),
+  joinTournament: (token: string, id: string) =>
+    request<null>(`/tournaments/${id}/join`, { method: 'POST', token, body: {} }),
+  startTournament: (token: string, id: string) =>
+    request<TournamentDto>(`/tournaments/${id}/start`, { method: 'POST', token, body: {} }),
 };

@@ -4,8 +4,6 @@
 //! from the Rust source of truth (`cargo test -p protocol` regenerates them
 //! into `src/lib/generated`).
 
-export type { ProfileDto } from './generated/ProfileDto';
-export type { RatingDto } from './generated/RatingDto';
 export type { AppliedMoveDto } from './generated/AppliedMoveDto';
 export type { AuthResponse } from './generated/AuthResponse';
 export type { ClockDto } from './generated/ClockDto';
@@ -29,3 +27,13 @@ export type { RegisterRequest } from './generated/RegisterRequest';
 export type { ResultReasonDto } from './generated/ResultReasonDto';
 export type { ServerMessage } from './generated/ServerMessage';
 export type { UserDto } from './generated/UserDto';
+export type { ProfileDto } from './generated/ProfileDto';
+export type { RatingDto } from './generated/RatingDto';
+export type { CreateTournamentRequest } from './generated/CreateTournamentRequest';
+export type { PairingDto } from './generated/PairingDto';
+export type { ParticipantDto } from './generated/ParticipantDto';
+export type { RoundDto } from './generated/RoundDto';
+export type { TournamentDto } from './generated/TournamentDto';
+export type { TournamentStatusDto } from './generated/TournamentStatusDto';
+export type { TournamentView } from './generated/TournamentView';
+export type { TournamentsResponse } from './generated/TournamentsResponse';

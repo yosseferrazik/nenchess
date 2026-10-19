@@ -389,6 +389,7 @@ async fn end_to_end() -> anyhow::Result<()> {
     spectator_scenario(&api, &white, &black).await?;
     matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
+    tournament_scenario(&api).await?;
 
     Ok(())
 }
@@ -1125,6 +1126,403 @@ async fn ratings_scenario(api: &Api) -> anyhow::Result<()> {
         "a casual result must not move the rating"
     );
     assert_eq!(rapid_rating(&after_casual).games_played, 1);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tournament helpers
+// ---------------------------------------------------------------------------
+
+async fn create_tournament(
+    api: &Api,
+    token: &str,
+    name: &str,
+    max_participants: i32,
+) -> anyhow::Result<protocol::TournamentDto> {
+    let (status, body) = api
+        .post(
+            "/api/tournaments",
+            Some(token),
+            json!({
+                "name": name,
+                "time_control_initial_ms": 600_000,
+                "time_control_increment_ms": 0,
+                "rated": false,
+                "max_participants": max_participants,
+            }),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::CREATED,
+        "create tournament expected 201, got {status}: {body}"
+    );
+    Ok(serde_json::from_value(body)?)
+}
+
+async fn get_tournament(
+    api: &Api,
+    token: &str,
+    id: Uuid,
+) -> anyhow::Result<protocol::TournamentView> {
+    let (status, body) = api
+        .get(&format!("/api/tournaments/{id}"), Some(token))
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "get tournament expected 200, got {status}: {body}"
+    );
+    Ok(serde_json::from_value(body)?)
+}
+
+async fn list_tournaments(api: &Api, token: &str) -> anyhow::Result<protocol::TournamentsResponse> {
+    let (status, body) = api.get("/api/tournaments", Some(token)).await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "list tournaments expected 200, got {status}: {body}"
+    );
+    Ok(serde_json::from_value(body)?)
+}
+
+async fn join_tournament(api: &Api, token: &str, id: Uuid) -> anyhow::Result<()> {
+    let (status, body) = api
+        .post(
+            &format!("/api/tournaments/{id}/join"),
+            Some(token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "join tournament expected 200, got {status}: {body}"
+    );
+    Ok(())
+}
+
+async fn start_tournament(api: &Api, token: &str, id: Uuid) -> anyhow::Result<()> {
+    let (status, body) = api
+        .post(
+            &format!("/api/tournaments/{id}/start"),
+            Some(token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::OK,
+        "start tournament expected 200, got {status}: {body}"
+    );
+    Ok(())
+}
+
+/// Resign a tournament game on behalf of `token`, whoever they are seated as.
+///
+/// Returns the winner's user id so standings can be asserted without the test
+/// having to know the colours the organizer was assigned.
+async fn resign_tournament_game(api: &Api, token: &str, game_id: Uuid) -> anyhow::Result<Uuid> {
+    let mut peer = Peer::connect(&api.base, token, "tournament-player").await?;
+    let sub = subscribe(game_id);
+    peer.send(&sub).await?;
+    peer.response_to(command_id(&sub)).await?;
+    let resign = ClientMessage::GameResign {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    peer.send(&resign).await?;
+    let ended = peer.response_to(command_id(&resign)).await?;
+    let view = expect_state(ended);
+    let result = view.result.context("finished game must carry a result")?;
+
+    let winner = match result.winner {
+        Some(protocol::ColorDto::White) => view.white.as_ref().context("white winner")?.user_id,
+        Some(protocol::ColorDto::Black) => view.black.as_ref().context("black winner")?.user_id,
+        None => anyhow::bail!("a resignation can never be a draw"),
+    };
+    Ok(winner)
+}
+
+/// The standings entry for `user_id`, if present.
+fn standing_for(
+    view: &protocol::TournamentView,
+    user_id: Uuid,
+) -> Option<&protocol::ParticipantDto> {
+    view.standings.iter().find(|p| p.user_id == user_id)
+}
+
+// ---------------------------------------------------------------------------
+// Tournament scenario
+// ---------------------------------------------------------------------------
+
+/// Create → join → start → play → finish, all through the public API.
+async fn tournament_scenario(api: &Api) -> anyhow::Result<()> {
+    let organizer = register(api, &TestUser::new("trn_org")).await?;
+    let one = register(api, &TestUser::new("trn_one")).await?;
+    let two = register(api, &TestUser::new("trn_two")).await?;
+
+    // An empty tournament cannot be started: there is nobody to pair.
+    let lonely = create_tournament(api, &organizer.token, "Solitaire", 4).await?;
+    let (status, body) = api
+        .post(
+            &format!("/api/tournaments/{}/start", lonely.id),
+            Some(&organizer.token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::BAD_REQUEST,
+        "starting a one-player tournament must be rejected, got {status}: {body}"
+    );
+    anyhow::ensure!(
+        error_code(&body)? == ErrorCode::BadRequest,
+        "expected bad_request, got {body}"
+    );
+
+    // Names are validated up front.
+    let (status, _) = api
+        .post(
+            "/api/tournaments",
+            Some(&organizer.token),
+            json!({
+                "name": "",
+                "time_control_initial_ms": 600_000,
+                "time_control_increment_ms": 0,
+                "rated": false,
+                "max_participants": 4,
+            }),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::BAD_REQUEST,
+        "an empty tournament name must be rejected, got {status}"
+    );
+
+    // A real three-player round robin.
+    let created = create_tournament(api, &organizer.token, "Copa NenChess", 8).await?;
+    assert_eq!(created.status, protocol::TournamentStatusDto::Registration);
+    assert_eq!(created.current_round, 0);
+    assert_eq!(created.total_rounds, 0);
+    assert_eq!(created.created_by, organizer.user.id);
+
+    // The creator is auto-enrolled; the two guests join.
+    let view = get_tournament(api, &one.token, created.id).await?;
+    assert_eq!(view.participants.len(), 1, "creator is auto-enrolled");
+    join_tournament(api, &one.token, created.id).await?;
+    join_tournament(api, &two.token, created.id).await?;
+
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(view.participants.len(), 3);
+    assert_eq!(view.rounds.len(), 0, "no rounds exist before the start");
+    for participant in &view.participants {
+        assert_eq!(participant.points, 0.0);
+        assert_eq!(participant.games_played, 0);
+        assert_eq!(
+            participant.rating_snapshot, 1500,
+            "fresh accounts start at 1500"
+        );
+    }
+
+    // Joining twice is a conflict, and a fourth player would exceed a full
+    // roster only after we fill it — here we just cover the duplicate case.
+    let (status, body) = api
+        .post(
+            &format!("/api/tournaments/{}/join", created.id),
+            Some(&one.token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::CONFLICT,
+        "a duplicate join must conflict, got {status}: {body}"
+    );
+
+    // Only the organizer may start.
+    let (status, _) = api
+        .post(
+            &format!("/api/tournaments/{}/start", created.id),
+            Some(&one.token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::FORBIDDEN,
+        "a participant must not start the tournament, got {status}"
+    );
+
+    // Start: three players (odd field) → the circle method pads a bye slot,
+    // giving three rounds where every player sits out exactly once.
+    start_tournament(api, &organizer.token, created.id).await?;
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(
+        view.tournament.status,
+        protocol::TournamentStatusDto::Active
+    );
+    assert_eq!(view.tournament.current_round, 1);
+    assert_eq!(
+        view.tournament.total_rounds, 3,
+        "odd fields add a bye round"
+    );
+
+    let first_round = view
+        .rounds
+        .iter()
+        .find(|r| r.round_number == 1)
+        .context("round 1 must exist")?;
+    anyhow::ensure!(
+        first_round.pairings.len() == 2,
+        "round 1 must pair two games, got {}",
+        first_round.pairings.len()
+    );
+    let byes = first_round.pairings.iter().filter(|p| p.bye).count();
+    anyhow::ensure!(byes == 1, "one player sits out round 1 with a bye");
+    let played: Vec<_> = first_round.pairings.iter().filter(|p| !p.bye).collect();
+    for pairing in &played {
+        anyhow::ensure!(
+            pairing.game_id.is_some(),
+            "every non-bye pairing must carry a game"
+        );
+    }
+
+    // Starting twice is rejected while the tournament is running.
+    let (status, _) = api
+        .post(
+            &format!("/api/tournaments/{}/start", created.id),
+            Some(&organizer.token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::BAD_REQUEST,
+        "restarting a running tournament must be rejected, got {status}"
+    );
+
+    // Play out round 1: whoever holds a game resigns it.
+    let mut first_winners: Vec<Uuid> = Vec::new();
+    for pairing in played {
+        let game_id = pairing.game_id.context("non-bye pairing has a game")?;
+        let (white_id, black_id) = (pairing.white_id, pairing.black_id);
+        let resigner = if white_id == Some(organizer.user.id) || black_id == Some(organizer.user.id)
+        {
+            &organizer.token
+        } else if white_id == Some(one.user.id) || black_id == Some(one.user.id) {
+            &one.token
+        } else {
+            &two.token
+        };
+        first_winners.push(resign_tournament_game(api, resigner, game_id).await?);
+    }
+
+    // The bye has already scored: someone sits on a point before any game.
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    let leaders: Vec<_> = view.standings.iter().filter(|p| p.points > 0.0).collect();
+    anyhow::ensure!(
+        !leaders.is_empty(),
+        "the bye recipient must already have scored a point"
+    );
+
+    // A player who both won a game and took the bye leads on two points; a
+    // player who won a single game sits on one.
+    for winner in &first_winners {
+        let entry = standing_for(&view, *winner).context("a winner must be ranked")?;
+        anyhow::ensure!(
+            entry.points >= 1.0,
+            "a round 1 winner must have scored, got {} for {}",
+            entry.points,
+            entry.username
+        );
+    }
+
+    // Round 2 is open as soon as round 1 is fully decided.
+    anyhow::ensure!(
+        view.tournament.current_round == 2,
+        "round 2 must open, got {}",
+        view.tournament.current_round
+    );
+
+    // Play every remaining round: each completion opens the next one, and the
+    // last decided round finishes the tournament.
+    let mut current = view;
+    for expected_round in 2..=current.tournament.total_rounds {
+        anyhow::ensure!(
+            current.tournament.current_round == expected_round,
+            "round {expected_round} must be current, got {}",
+            current.tournament.current_round
+        );
+        let round = current
+            .rounds
+            .iter()
+            .find(|r| r.round_number == expected_round)
+            .with_context(|| format!("round {expected_round} must exist"))?;
+        let byes = round.pairings.iter().filter(|p| p.bye).count();
+        anyhow::ensure!(byes == 1, "round {expected_round} sits one player out");
+
+        for pairing in round.pairings.iter().filter(|p| !p.bye).collect::<Vec<_>>() {
+            let game_id = pairing.game_id.context("non-bye pairing has a game")?;
+            let resigner = if pairing.white_id == Some(organizer.user.id)
+                || pairing.black_id == Some(organizer.user.id)
+            {
+                &organizer.token
+            } else if pairing.white_id == Some(one.user.id) || pairing.black_id == Some(one.user.id)
+            {
+                &one.token
+            } else {
+                &two.token
+            };
+            resign_tournament_game(api, resigner, game_id).await?;
+        }
+
+        if expected_round < current.tournament.total_rounds {
+            current = get_tournament(api, &organizer.token, created.id).await?;
+        }
+    }
+
+    // Every game is decided, so the tournament is finished and the standings
+    // account for all three players.
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(
+        view.tournament.status,
+        protocol::TournamentStatusDto::Finished
+    );
+    assert!(
+        view.tournament.finished_at_ms.is_some(),
+        "a finished tournament records when it ended"
+    );
+    assert_eq!(view.standings.len(), 3, "every participant is ranked");
+    for participant in &view.standings {
+        anyhow::ensure!(
+            participant.games_played > 0,
+            "{} must have played or taken a bye",
+            participant.username
+        );
+    }
+    // Standings are sorted by descending points.
+    for pair in view.standings.windows(2) {
+        anyhow::ensure!(
+            pair[0].points >= pair[1].points,
+            "standings must be ordered by points: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // The list endpoint surfaces the finished tournament to everyone.
+    let listed = list_tournaments(api, &two.token).await?;
+    anyhow::ensure!(
+        listed.tournaments.iter().any(|t| t.id == created.id),
+        "the list must include the tournament that was just played"
+    );
+
+    // A finished tournament can no longer accept registrations.
+    let late = register(api, &TestUser::new("trn_late")).await?;
+    let (status, _) = api
+        .post(
+            &format!("/api/tournaments/{}/join", created.id),
+            Some(&late.token),
+            json!({}),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::BAD_REQUEST,
+        "a finished tournament must refuse new entrants, got {status}"
+    );
 
     Ok(())
 }

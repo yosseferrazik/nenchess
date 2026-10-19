@@ -7,6 +7,7 @@ import { GamePage } from './pages/GamePage';
 import { LobbyPage } from './pages/LobbyPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { TournamentsPage } from './pages/TournamentsPage';
+import { TournamentDetailPage } from './pages/TournamentDetailPage';
 
 function Protected({ children }: { children: ReactElement }) {
   const { session, checking } = useAuth();
@@ -72,6 +73,14 @@ export function App() {
             element={
               <Protected>
                 <TournamentsPage />
+              </Protected>
+            }
+          />
+          <Route
+            path="/tournaments/:tournamentId"
+            element={
+              <Protected>
+                <TournamentDetailPage />
               </Protected>
             }
           />
