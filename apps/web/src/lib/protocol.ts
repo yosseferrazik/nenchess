@@ -37,6 +37,7 @@ export type { PairingDto } from './generated/PairingDto';
 export type { ParticipantDto } from './generated/ParticipantDto';
 export type { RoundDto } from './generated/RoundDto';
 export type { TournamentDto } from './generated/TournamentDto';
+export type { TournamentFormatDto } from './generated/TournamentFormatDto';
 export type { TournamentStatusDto } from './generated/TournamentStatusDto';
 export type { TournamentView } from './generated/TournamentView';
 export type { TournamentsResponse } from './generated/TournamentsResponse';

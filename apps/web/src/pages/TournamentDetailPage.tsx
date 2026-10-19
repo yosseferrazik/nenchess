@@ -60,6 +60,7 @@ export function TournamentDetailPage() {
       <h2>{tournament.name}</h2>
       <p className="muted small">
         {tournament.time_control_initial_ms / 60_000}+{tournament.time_control_increment_ms / 1_000} ·{' '}
+        {tournament.format === 'swiss' ? 'suizo' : 'todos contra todos'} ·{' '}
         {tournament.rated ? 'clasificatoria' : 'amistosa'} · ronda{' '}
         {tournament.current_round}/{tournament.total_rounds || '—'}
       </p>

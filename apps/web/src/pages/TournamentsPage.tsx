@@ -3,12 +3,17 @@ import { Link } from 'react-router-dom';
 
 import { useAuth } from '../lib/auth';
 import { ApiError, http } from '../lib/http';
-import type { CreateTournamentRequest, TournamentDto } from '../lib/protocol';
+import type { CreateTournamentRequest, TournamentDto, TournamentFormatDto } from '../lib/protocol';
 
 const STATUS_LABEL: Record<TournamentDto['status'], string> = {
   registration: 'Inscripción abierta',
   active: 'En curso',
   finished: 'Finalizado',
+};
+
+const FORMAT_LABEL: Record<TournamentFormatDto, string> = {
+  round_robin: 'Todos contra todos',
+  swiss: 'Suizo',
 };
 
 export function TournamentsPage() {
@@ -24,6 +29,7 @@ export function TournamentsPage() {
     time_control_increment_ms: 2_000,
     rated: true,
     max_participants: 8,
+    format: 'round_robin',
   });
 
   const load = useCallback(async () => {
@@ -122,6 +128,16 @@ export function TournamentsPage() {
               onChange={(e) => setForm({ ...form, max_participants: Number(e.target.value) })}
             />
           </label>
+          <label>
+            Sistema
+            <select
+              value={form.format}
+              onChange={(e) => setForm({ ...form, format: e.target.value as TournamentFormatDto })}
+            >
+              <option value="round_robin">Todos contra todos</option>
+              <option value="swiss">Suizo (ceil(log2(n)) rondas)</option>
+            </select>
+          </label>
           <label className="checkbox">
             <input
               type="checkbox"
@@ -146,6 +162,7 @@ export function TournamentsPage() {
               <tr>
                 <th>Nombre</th>
                 <th>Estado</th>
+                <th>Sistema</th>
                 <th>Ronda</th>
                 <th>Tiempo</th>
                 <th></th>
@@ -158,6 +175,7 @@ export function TournamentsPage() {
                     <Link to={`/tournaments/${t.id}`}>{t.name}</Link>
                   </td>
                   <td>{STATUS_LABEL[t.status]}</td>
+                  <td>{FORMAT_LABEL[t.format]}</td>
                   <td>
                     {t.current_round}/{t.total_rounds || '—'}
                   </td>
