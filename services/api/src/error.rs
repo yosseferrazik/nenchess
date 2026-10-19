@@ -129,6 +129,7 @@ impl From<DomainError> for ApiError {
             DomainError::GameFull => ErrorCode::GameFull,
             DomainError::AlreadySeated => ErrorCode::BadRequest,
             DomainError::IllegalMove(_) => ErrorCode::IllegalMove,
+            DomainError::NoPendingDrawOffer => ErrorCode::Conflict,
         };
         ApiError::from_code(code, message)
     }

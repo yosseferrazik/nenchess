@@ -134,6 +134,7 @@ pub enum ResultReasonDto {
     ThreefoldRepetition,
     InsufficientMaterial,
     Abandonment,
+    Agreement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -214,6 +215,10 @@ pub struct GameView {
     pub rated: bool,
     /// Full move history (immutable records), oldest first.
     pub moves: Vec<MoveDto>,
+    /// Colour with a pending draw offer on an active game; `null` when no
+    /// offer stands. Auxiliary state: it never bumps `version`.
+    #[serde(default)]
+    pub draw_offered_by: Option<ColorDto>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
@@ -326,6 +331,19 @@ pub enum ClientMessage {
     /// Resign the game as the issuing player.
     #[serde(rename = "game.resign")]
     GameResign { command_id: Uuid, game_id: Uuid },
+
+    /// Offer a draw as the issuing player. If the opponent already has a
+    /// pending offer, offering back ends the game by mutual agreement.
+    #[serde(rename = "game.draw_offer")]
+    DrawOffer { command_id: Uuid, game_id: Uuid },
+
+    /// Accept the opponent's pending draw offer: the game ends drawn.
+    #[serde(rename = "game.draw_accept")]
+    DrawAccept { command_id: Uuid, game_id: Uuid },
+
+    /// Decline the opponent's pending offer, or withdraw your own.
+    #[serde(rename = "game.draw_decline")]
+    DrawDecline { command_id: Uuid, game_id: Uuid },
 }
 
 /// A move as the client expresses it. Coordinates only — the server validates
@@ -380,6 +398,15 @@ pub enum ServerMessage {
 
     #[serde(rename = "game.player_left")]
     PlayerLeft { game_id: Uuid, user_id: Uuid },
+
+    /// The pending draw offer changed: a colour stands, or `null` when it
+    /// was cleared (declined, withdrawn, or implicitly by a move).
+    #[serde(rename = "game.draw_offer_changed")]
+    DrawOfferChanged {
+        command_id: Option<Uuid>,
+        game_id: Uuid,
+        offered_by: Option<ColorDto>,
+    },
 }
 
 impl ServerMessage {
@@ -391,6 +418,7 @@ impl ServerMessage {
             ServerMessage::GameEnded { game, .. } => Some(game.id),
             ServerMessage::PlayerJoined { game_id, .. } => Some(*game_id),
             ServerMessage::PlayerLeft { game_id, .. } => Some(*game_id),
+            ServerMessage::DrawOfferChanged { game_id, .. } => Some(*game_id),
             ServerMessage::Pong { .. } | ServerMessage::Error { .. } => None,
         }
     }
@@ -428,6 +456,51 @@ mod tests {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn draw_commands_use_the_documented_wire_shape() {
+        let cmd = ClientMessage::DrawOffer {
+            command_id: Uuid::nil(),
+            game_id: Uuid::nil(),
+        };
+        let json = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(json["type"], "game.draw_offer");
+
+        let event = ServerMessage::DrawOfferChanged {
+            command_id: None,
+            game_id: Uuid::nil(),
+            offered_by: Some(ColorDto::White),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "game.draw_offer_changed");
+        assert_eq!(json["offered_by"], "white");
+        let roundtrip: ServerMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(event, roundtrip);
+    }
+
+    #[test]
+    fn snapshots_tolerate_the_pre_draw_offers_shape() {
+        // Games finished (and responses stored) before migration 0005 have
+        // no `draw_offered_by` field; replays must keep deserializing.
+        let json = serde_json::json!({
+            "id": Uuid::nil(),
+            "status": "finished",
+            "version": 7,
+            "fen": "start",
+            "turn": null,
+            "white": null,
+            "black": null,
+            "clock": null,
+            "result": null,
+            "move_count": 0,
+            "initial_time_ms": 600000,
+            "increment_ms": 0,
+            "rated": false,
+            "moves": []
+        });
+        let view: GameView = serde_json::from_value(json).unwrap();
+        assert_eq!(view.draw_offered_by, None);
     }
 
     #[test]

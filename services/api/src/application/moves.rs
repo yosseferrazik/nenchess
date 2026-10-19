@@ -32,6 +32,23 @@ pub struct ResignCommand {
     pub game_id: Uuid,
 }
 
+/// The three draw intents share one pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawAction {
+    /// Propose a draw; counters a pending opponent offer (mutual agreement).
+    Offer,
+    /// Accept the opponent's pending offer.
+    Accept,
+    /// Decline the opponent's offer, or withdraw your own.
+    Decline,
+}
+
+pub struct DrawCommand {
+    pub command_id: Uuid,
+    pub game_id: Uuid,
+    pub action: DrawAction,
+}
+
 /// Submit a move. Returns the exact `ServerMessage` to send back to the
 /// caller; for retries that message is the one originally stored.
 pub async fn submit_move(
@@ -186,6 +203,79 @@ pub async fn submit_resign(
     }
 }
 
+/// Draw by agreement: offer, accept, decline/withdraw. Same pipeline as a
+/// move. Offer transitions keep `version` untouched — clients merge them
+/// through `game.draw_offer_changed`; only acceptance ends the game.
+pub async fn submit_draw(
+    state: &AppState,
+    user_id: Uuid,
+    cmd: DrawCommand,
+) -> Result<ServerMessage, ApiError> {
+    let _lock = state.registry.lock_for(cmd.game_id).await;
+    let mut tx = state.db.begin().await?;
+
+    let game = games_repo::find_for_update(&mut tx, cmd.game_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("game not found"))?;
+
+    if let Some(stored) = stored_response(&mut tx, cmd.command_id).await? {
+        tx.rollback().await.ok();
+        return Ok(stored);
+    }
+
+    let now = state.clock.now_ms();
+    let outcome = match cmd.action {
+        DrawAction::Offer => domain::offer_draw(game, user_id, now)?,
+        DrawAction::Accept => domain::accept_draw(game, user_id, now)?,
+        DrawAction::Decline => domain::decline_draw(game, user_id)?,
+    };
+
+    let message = match outcome {
+        domain::DrawOutcome::OfferChanged { game } => {
+            games_repo::update(&mut tx, &game).await?;
+            ServerMessage::DrawOfferChanged {
+                command_id: Some(cmd.command_id),
+                game_id: game.id,
+                offered_by: game.draw_offered_by.map(views::color_dto),
+            }
+        }
+        domain::DrawOutcome::Accepted { game } => {
+            games_repo::update(&mut tx, &game).await?;
+            ratings::settle(&mut tx, &game).await?;
+            tournaments::settle_game(&mut tx, &game).await?;
+            let view = views::game_view(&mut tx, &game, now).await?;
+            ServerMessage::GameEnded {
+                command_id: Some(cmd.command_id),
+                game: view,
+            }
+        }
+    };
+
+    match commit_with_idempotency(
+        &mut tx,
+        cmd.command_id,
+        user_id,
+        "game.draw",
+        cmd.game_id,
+        &message,
+    )
+    .await?
+    {
+        CommitOutcome::Committed => {
+            tx.commit().await?;
+            state
+                .metrics
+                .moves_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(message)
+        }
+        CommitOutcome::Replayed(stored) => {
+            tx.rollback().await.ok();
+            Ok(*stored)
+        }
+    }
+}
+
 async fn stored_response(
     tx: &mut DbTx<'_>,
     command_id: Uuid,
@@ -234,6 +324,7 @@ fn event_type_of(message: &ServerMessage) -> &'static str {
     match message {
         ServerMessage::MoveAccepted { .. } => "game.move_accepted",
         ServerMessage::GameEnded { .. } => "game.ended",
+        ServerMessage::DrawOfferChanged { .. } => "game.draw_offer",
         _ => "game.other",
     }
 }

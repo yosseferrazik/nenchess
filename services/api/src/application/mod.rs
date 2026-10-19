@@ -5,4 +5,6 @@
 pub mod moves;
 pub mod views;
 
-pub use moves::{submit_move, submit_resign, MoveCommand, ResignCommand};
+pub use moves::{
+    submit_draw, submit_move, submit_resign, DrawAction, DrawCommand, MoveCommand, ResignCommand,
+};

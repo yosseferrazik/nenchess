@@ -230,6 +230,48 @@ async fn handle_command(
                 .await
                 .map(Some)
         }
+
+        ClientMessage::DrawOffer {
+            command_id,
+            game_id,
+        } => {
+            submit_draw(
+                state,
+                user.id,
+                command_id,
+                game_id,
+                moves::DrawAction::Offer,
+            )
+            .await
+        }
+
+        ClientMessage::DrawAccept {
+            command_id,
+            game_id,
+        } => {
+            submit_draw(
+                state,
+                user.id,
+                command_id,
+                game_id,
+                moves::DrawAction::Accept,
+            )
+            .await
+        }
+
+        ClientMessage::DrawDecline {
+            command_id,
+            game_id,
+        } => {
+            submit_draw(
+                state,
+                user.id,
+                command_id,
+                game_id,
+                moves::DrawAction::Decline,
+            )
+            .await
+        }
     };
 
     match result {
@@ -243,13 +285,31 @@ async fn handle_command(
     }
 }
 
+async fn submit_draw(
+    state: &AppState,
+    user_id: Uuid,
+    command_id: Uuid,
+    game_id: Uuid,
+    action: moves::DrawAction,
+) -> Result<Option<ServerMessage>, ApiError> {
+    let command = moves::DrawCommand {
+        command_id,
+        game_id,
+        action,
+    };
+    moves::submit_draw(state, user_id, command).await.map(Some)
+}
+
 fn command_id_of(command: &ClientMessage) -> Option<Uuid> {
     match command {
         ClientMessage::Ping { command_id }
         | ClientMessage::GameSubscribe { command_id, .. }
         | ClientMessage::GameUnsubscribe { command_id, .. }
         | ClientMessage::GameMove { command_id, .. }
-        | ClientMessage::GameResign { command_id, .. } => Some(*command_id),
+        | ClientMessage::GameResign { command_id, .. }
+        | ClientMessage::DrawOffer { command_id, .. }
+        | ClientMessage::DrawAccept { command_id, .. }
+        | ClientMessage::DrawDecline { command_id, .. } => Some(*command_id),
     }
 }
 

@@ -89,6 +89,10 @@ fn build(
                 uci: m.uci,
             })
             .collect(),
+        draw_offered_by: active
+            .then_some(game.draw_offered_by)
+            .flatten()
+            .map(color_dto),
     }
 }
 
@@ -126,5 +130,6 @@ fn reason_dto(reason: ResultReason) -> ResultReasonDto {
         ResultReason::ThreefoldRepetition => ResultReasonDto::ThreefoldRepetition,
         ResultReason::InsufficientMaterial => ResultReasonDto::InsufficientMaterial,
         ResultReason::Abandonment => ResultReasonDto::Abandonment,
+        ResultReason::Agreement => ResultReasonDto::Agreement,
     }
 }

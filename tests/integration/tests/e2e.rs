@@ -298,6 +298,10 @@ impl Peer {
             | ServerMessage::GameEnded {
                 command_id: Some(command_id),
                 ..
+            }
+            | ServerMessage::DrawOfferChanged {
+                command_id: Some(command_id),
+                ..
             } => *command_id == expected,
             _ => false,
         })
@@ -339,7 +343,10 @@ fn command_id(command: &ClientMessage) -> Uuid {
         | ClientMessage::GameSubscribe { command_id, .. }
         | ClientMessage::GameUnsubscribe { command_id, .. }
         | ClientMessage::GameMove { command_id, .. }
-        | ClientMessage::GameResign { command_id, .. } => *command_id,
+        | ClientMessage::GameResign { command_id, .. }
+        | ClientMessage::DrawOffer { command_id, .. }
+        | ClientMessage::DrawAccept { command_id, .. }
+        | ClientMessage::DrawDecline { command_id, .. } => *command_id,
     }
 }
 
@@ -387,6 +394,7 @@ async fn end_to_end() -> anyhow::Result<()> {
     checkmate_scenario(&api, &white, &black).await?;
     repetition_scenario(&api, &white, &black).await?;
     spectator_scenario(&api, &white, &black).await?;
+    draw_offer_scenarios(&api, &white, &black).await?;
     matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
     tournament_scenario(&api).await?;
@@ -959,6 +967,164 @@ async fn repetition_scenario(
     white_peer.send(&after).await?;
     expect_error(
         white_peer.response_to(command_id(&after)).await?,
+        ErrorCode::GameOver,
+    );
+
+    Ok(())
+}
+
+/// Draw offers: pending state that never bumps the version, decline and
+/// withdrawal, implicit decline on a move, and settlement by agreement
+/// through the same consequences path as every other ending.
+async fn draw_offer_scenarios(
+    api: &Api,
+    white: &AuthResponse,
+    black: &AuthResponse,
+) -> anyhow::Result<()> {
+    let game = create_game(api, &white.token, 600_000).await?;
+    let game_id = game.id;
+    join_game(api, &black.token, game_id).await?;
+
+    let mut white_peer = Peer::connect(&api.base, &white.token, "draw-white").await?;
+    let mut black_peer = Peer::connect(&api.base, &black.token, "draw-black").await?;
+    let white_sub = subscribe(game_id);
+    white_peer.send(&white_sub).await?;
+    let snapshot = expect_state(white_peer.response_to(command_id(&white_sub)).await?);
+    assert_eq!(snapshot.version, 1);
+    assert_eq!(snapshot.draw_offered_by, None);
+    let black_sub = subscribe(game_id);
+    black_peer.send(&black_sub).await?;
+    expect_state(black_peer.response_to(command_id(&black_sub)).await?);
+
+    // Accepting with nothing pending is a conflict, not a silent no-op.
+    let early = ClientMessage::DrawAccept {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    black_peer.send(&early).await?;
+    expect_error(
+        black_peer.response_to(command_id(&early)).await?,
+        ErrorCode::Conflict,
+    );
+
+    // White offers: the ack carries the new state, black learns it through
+    // the outbox, and the version does not move.
+    let offer = ClientMessage::DrawOffer {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    white_peer.send(&offer).await?;
+    match white_peer.response_to(command_id(&offer)).await? {
+        ServerMessage::DrawOfferChanged { offered_by, .. } => {
+            assert_eq!(offered_by, Some(protocol::ColorDto::White));
+        }
+        other => panic!("expected draw_offer_changed, got {other:?}"),
+    }
+    let event = black_peer
+        .next_matching(|m| {
+            matches!(
+                m,
+                ServerMessage::DrawOfferChanged {
+                    offered_by: Some(_),
+                    ..
+                }
+            )
+        })
+        .await?;
+    assert!(matches!(
+        event,
+        ServerMessage::DrawOfferChanged {
+            offered_by: Some(protocol::ColorDto::White),
+            ..
+        }
+    ));
+    let http_view = get_game(api, &black.token, game_id).await?;
+    assert_eq!(http_view.draw_offered_by, Some(protocol::ColorDto::White));
+    assert_eq!(
+        http_view.version, 1,
+        "an offer is auxiliary state, not a new version"
+    );
+
+    // Black declines: cleared for everyone.
+    let decline = ClientMessage::DrawDecline {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    black_peer.send(&decline).await?;
+    match black_peer.response_to(command_id(&decline)).await? {
+        ServerMessage::DrawOfferChanged {
+            offered_by: None, ..
+        } => {}
+        other => panic!("expected a cleared offer, got {other:?}"),
+    }
+    white_peer
+        .next_matching(|m| {
+            matches!(
+                m,
+                ServerMessage::DrawOfferChanged {
+                    offered_by: None,
+                    ..
+                }
+            )
+        })
+        .await?;
+
+    // A legal move implicitly declines: black offers out of turn, white
+    // simply plays and the offer dies with the move transaction.
+    let offer = ClientMessage::DrawOffer {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    black_peer.send(&offer).await?;
+    black_peer.response_to(command_id(&offer)).await?;
+    let mv = move_command(game_id, 1, "e2e4");
+    white_peer.send(&mv).await?;
+    let after_move = expect_state(white_peer.response_to(command_id(&mv)).await?);
+    assert_eq!(after_move.version, 2);
+    assert_eq!(after_move.draw_offered_by, None);
+
+    // Settle by acceptance: white offers, black accepts, game drawn.
+    let offer = ClientMessage::DrawOffer {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    white_peer.send(&offer).await?;
+    white_peer.response_to(command_id(&offer)).await?;
+    let accept = ClientMessage::DrawAccept {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    black_peer.send(&accept).await?;
+    let ended = expect_state(black_peer.response_to(command_id(&accept)).await?);
+    assert_eq!(ended.status, protocol::GameStatusDto::Finished);
+    assert_eq!(ended.version, 3, "only the ending bumps the version");
+    let result = ended.result.expect("result is set");
+    assert_eq!(result.winner, None, "agreement is a draw");
+    assert_eq!(result.reason, protocol::ResultReasonDto::Agreement);
+
+    // Both players see the end through the outbox.
+    white_peer
+        .next_matching(|m| matches!(m, ServerMessage::GameEnded { .. }))
+        .await?;
+
+    // Idempotency: the earlier offer replays its stored answer even though
+    // the game has finished in the meantime.
+    white_peer.send(&offer).await?;
+    match white_peer.response_to(command_id(&offer)).await? {
+        ServerMessage::DrawOfferChanged { offered_by, .. } => {
+            assert_eq!(offered_by, Some(protocol::ColorDto::White));
+        }
+        other => panic!("expected the stored offer to replay, got {other:?}"),
+    }
+
+    // No new offers after the end.
+    let late_offer = ClientMessage::DrawOffer {
+        command_id: Uuid::new_v4(),
+        game_id,
+    };
+    white_peer.send(&late_offer).await?;
+    expect_error(
+        white_peer.response_to(command_id(&late_offer)).await?,
         ErrorCode::GameOver,
     );
 

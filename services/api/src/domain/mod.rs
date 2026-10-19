@@ -6,6 +6,6 @@
 mod game;
 
 pub use game::{
-    apply_move, join, resign, DomainError, Game, GameResult, GameStatus, MoveOutcome, MoveRecord,
-    ResultReason,
+    accept_draw, apply_move, decline_draw, join, offer_draw, resign, DomainError, DrawOutcome,
+    Game, GameResult, GameStatus, MoveOutcome, MoveRecord, ResultReason,
 };

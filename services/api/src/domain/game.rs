@@ -49,6 +49,7 @@ pub enum ResultReason {
     ThreefoldRepetition,
     InsufficientMaterial,
     Abandonment,
+    Agreement,
 }
 
 impl ResultReason {
@@ -62,6 +63,7 @@ impl ResultReason {
             ResultReason::ThreefoldRepetition => "threefold_repetition",
             ResultReason::InsufficientMaterial => "insufficient_material",
             ResultReason::Abandonment => "abandonment",
+            ResultReason::Agreement => "agreement",
         }
     }
 
@@ -75,6 +77,7 @@ impl ResultReason {
             "threefold_repetition" => Some(ResultReason::ThreefoldRepetition),
             "insufficient_material" => Some(ResultReason::InsufficientMaterial),
             "abandonment" => Some(ResultReason::Abandonment),
+            "agreement" => Some(ResultReason::Agreement),
             _ => None,
         }
     }
@@ -118,6 +121,9 @@ pub struct Game {
     /// initial position (see `game_core::position_hash`). Used to detect
     /// threefold repetition; appended on every move.
     pub position_hashes: Vec<i64>,
+    /// Colour with a pending draw offer. Auxiliary state: transitions never
+    /// bump `version`, and a legal move clears it.
+    pub draw_offered_by: Option<Color>,
 }
 
 impl Game {
@@ -146,6 +152,7 @@ impl Game {
             clock: Clock::new(initial_time_ms, increment_ms, Color::White, now_ms),
             result: None,
             position_hashes: vec![position_hash_of(starting_fen())],
+            draw_offered_by: None,
         }
     }
 
@@ -187,6 +194,8 @@ pub enum DomainError {
     AlreadySeated,
     #[error("illegal move: {0}")]
     IllegalMove(String),
+    #[error("there is no draw offer to accept or decline")]
+    NoPendingDrawOffer,
 }
 
 /// Result of attempting a move.
@@ -245,6 +254,7 @@ pub fn apply_move(
             Color::White => g.clock.white_ms = 0,
             Color::Black => g.clock.black_ms = 0,
         }
+        g.draw_offered_by = None;
         g.version += 1;
         g.status = GameStatus::Finished;
         g.result = Some(GameResult {
@@ -260,6 +270,9 @@ pub fn apply_move(
     let mut g = game;
     g.version += 1;
     g.move_count += 1;
+    // A legal move implicitly clears any pending draw offer (FIDE: the offer
+    // does not survive the opponent's move).
+    g.draw_offered_by = None;
     let move_number = g.move_count;
     g.clock.apply_move(mover_color, now_ms);
     g.turn = g.clock.turn;
@@ -351,11 +364,93 @@ pub fn resign(game: Game, resigner: Uuid, now_ms: i64) -> Result<Game, DomainErr
     *rest = (*rest - elapsed).max(0);
     g.version += 1;
     g.status = GameStatus::Finished;
+    g.draw_offered_by = None;
     g.result = Some(GameResult {
         winner: Some(resigner_color.opposite()),
         reason: ResultReason::Resignation,
     });
     Ok(g)
+}
+
+/// Result of a draw command. Offer/decline transitions are auxiliary state
+/// (no version bump); only acceptance ends the game.
+pub enum DrawOutcome {
+    /// The pending offer now stands or is cleared; the game continues.
+    OfferChanged { game: Game },
+    /// The opponent's offer was accepted (or answered with a counter-offer):
+    /// the game ends drawn by agreement.
+    Accepted { game: Game },
+}
+
+/// Offer a draw. Answering an opponent's pending offer with one of your own
+/// is mutual agreement, so the game ends immediately.
+pub fn offer_draw(game: Game, user: Uuid, now_ms: i64) -> Result<DrawOutcome, DomainError> {
+    game.require_active()?;
+    let color = game
+        .participant_color(user)
+        .ok_or(DomainError::NotParticipant)?;
+    if game.draw_offered_by == Some(color.opposite()) {
+        return Ok(DrawOutcome::Accepted {
+            game: finish_by_agreement(game, now_ms),
+        });
+    }
+    let mut g = game;
+    if g.draw_offered_by != Some(color) {
+        g.draw_offered_by = Some(color);
+    }
+    Ok(DrawOutcome::OfferChanged { game: g })
+}
+
+/// Accept the opponent's pending draw offer.
+pub fn accept_draw(game: Game, user: Uuid, now_ms: i64) -> Result<DrawOutcome, DomainError> {
+    game.require_active()?;
+    let color = game
+        .participant_color(user)
+        .ok_or(DomainError::NotParticipant)?;
+    match game.draw_offered_by {
+        Some(offered) if offered != color => Ok(DrawOutcome::Accepted {
+            game: finish_by_agreement(game, now_ms),
+        }),
+        _ => Err(DomainError::NoPendingDrawOffer),
+    }
+}
+
+/// Decline the opponent's pending offer; a player with their own offer
+/// standing withdraws it instead. Idempotent intent, but a no-op without a
+/// pending offer is rejected so clients notice their stale UI state.
+pub fn decline_draw(game: Game, user: Uuid) -> Result<DrawOutcome, DomainError> {
+    game.require_active()?;
+    let color = game
+        .participant_color(user)
+        .ok_or(DomainError::NotParticipant)?;
+    match game.draw_offered_by {
+        Some(offered) if offered == color || offered == color.opposite() => {
+            let mut g = game;
+            g.draw_offered_by = None;
+            Ok(DrawOutcome::OfferChanged { game: g })
+        }
+        _ => Err(DomainError::NoPendingDrawOffer),
+    }
+}
+
+/// End the game as a draw by agreement. Like resignation, it charges the
+/// running clock up to this instant so final snapshots stay truthful.
+fn finish_by_agreement(game: Game, now_ms: i64) -> Game {
+    let mut g = game;
+    let elapsed = g.clock.elapsed_ms(now_ms);
+    let rest = match g.clock.turn {
+        Color::White => &mut g.clock.white_ms,
+        Color::Black => &mut g.clock.black_ms,
+    };
+    *rest = (*rest - elapsed).max(0);
+    g.version += 1;
+    g.status = GameStatus::Finished;
+    g.draw_offered_by = None;
+    g.result = Some(GameResult {
+        winner: None,
+        reason: ResultReason::Agreement,
+    });
+    g
 }
 
 /// Second player joins: the game becomes active and the clocks are anchored
@@ -627,6 +722,130 @@ mod tests {
     }
 
     #[test]
+    fn offer_and_accept_draw_settle_by_agreement() {
+        let now = 1_000;
+        let (game, white, black) = active_game(now);
+
+        // Accepting with nothing pending is rejected.
+        assert!(matches!(
+            accept_draw(game.clone(), black, now),
+            Err(DomainError::NoPendingDrawOffer)
+        ));
+
+        // Offering is auxiliary state: no version bump.
+        let offered = match offer_draw(game, white, now).expect("offer") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        assert_eq!(offered.draw_offered_by, Some(Color::White));
+        assert_eq!(offered.version, 1);
+        assert_eq!(offered.status, GameStatus::Active);
+
+        // Accept ends the game: draw, clock charged 30s to the offerer side
+        // (white to move), version bumped once.
+        let ended = match accept_draw(offered, black, now + 30_000).expect("accept") {
+            DrawOutcome::Accepted { game } => game,
+            _ => panic!("expected Accepted"),
+        };
+        assert_eq!(ended.status, GameStatus::Finished);
+        assert_eq!(
+            ended.result,
+            Some(GameResult {
+                winner: None,
+                reason: ResultReason::Agreement
+            })
+        );
+        assert_eq!(ended.clock.white_ms, 570_000);
+        assert_eq!(ended.version, 2);
+        assert_eq!(ended.draw_offered_by, None);
+
+        // Strangers cannot offer.
+        let (game2, _w, _b) = active_game(now);
+        assert!(matches!(
+            offer_draw(game2, Uuid::new_v4(), now),
+            Err(DomainError::NotParticipant)
+        ));
+    }
+
+    #[test]
+    fn counter_offering_is_mutual_agreement() {
+        let now = 1_000;
+        let (game, white, black) = active_game(now);
+        let offered = match offer_draw(game, white, now).expect("offer") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        // Black answers the offer with one of their own: the game ends.
+        match offer_draw(offered, black, now + 5_000).expect("counter-offer") {
+            DrawOutcome::Accepted { game } => {
+                assert_eq!(game.status, GameStatus::Finished);
+                assert_eq!(
+                    game.result,
+                    Some(GameResult {
+                        winner: None,
+                        reason: ResultReason::Agreement
+                    })
+                );
+            }
+            _ => panic!("counter-offer must be accepted"),
+        }
+    }
+
+    #[test]
+    fn decline_clears_and_withdraws_pending_offers() {
+        let now = 1_000;
+        let (game, white, black) = active_game(now);
+
+        // Nothing to decline yet.
+        assert!(matches!(
+            decline_draw(game.clone(), black),
+            Err(DomainError::NoPendingDrawOffer)
+        ));
+
+        let offered = match offer_draw(game, white, now).expect("offer") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        // The recipient declines.
+        let cleared = match decline_draw(offered, black).expect("decline") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        assert_eq!(cleared.draw_offered_by, None);
+        assert_eq!(cleared.version, 1);
+
+        // The offerer withdraws their own.
+        let offered = match offer_draw(cleared, white, now + 2_000).expect("offer again") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        let withdrawn = match decline_draw(offered, white).expect("withdraw") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        assert_eq!(withdrawn.draw_offered_by, None);
+    }
+
+    #[test]
+    fn a_legal_move_clears_any_pending_offer() {
+        let now = 1_000;
+        let (game, white, black) = active_game(now);
+        let offered = match offer_draw(game, black, now).expect("offer") {
+            DrawOutcome::OfferChanged { game } => game,
+            _ => panic!("expected OfferChanged"),
+        };
+        // Black offered out of turn; white simply plays — the offer dies.
+        let outcome = apply_move(offered, white, 1, &mv("e2e4"), now + 10).expect("legal move");
+        match outcome {
+            MoveOutcome::Applied { game, ended, .. } => {
+                assert!(!ended);
+                assert_eq!(game.draw_offered_by, None);
+            }
+            _ => panic!("expected Applied"),
+        }
+    }
+
+    #[test]
     fn status_and_reason_roundtrip_through_db_strings() {
         assert_eq!(GameStatus::from_db("active"), Some(GameStatus::Active));
         assert_eq!(GameStatus::from_db("nope"), None);
@@ -644,6 +863,11 @@ mod tests {
             "insufficient_material"
         );
         assert_eq!(ResultReason::Flag.as_db(), "flag");
+        assert_eq!(
+            ResultReason::from_db("agreement"),
+            Some(ResultReason::Agreement)
+        );
+        assert_eq!(ResultReason::Agreement.as_db(), "agreement");
         assert_eq!(ResultReason::from_db("nope"), None);
     }
 }
