@@ -25,4 +25,9 @@ clock: ClockDto | null, result: GameResultDto | null, move_count: number, initia
 /**
  * Full move history (immutable records), oldest first.
  */
-moves: Array<MoveDto>, };
+moves: Array<MoveDto>, 
+/**
+ * Colour with a pending draw offer on an active game; `null` when no
+ * offer stands. Auxiliary state: it never bumps `version`.
+ */
+draw_offered_by: ColorDto | null, };

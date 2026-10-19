@@ -36,6 +36,9 @@ export function useGameSocket(gameId: string | null): {
   state: LiveState;
   move: (from: string, to: string, promotion: PieceKindDto | null) => Promise<void>;
   resign: () => Promise<void>;
+  offerDraw: () => Promise<void>;
+  acceptDraw: () => Promise<void>;
+  declineDraw: () => Promise<void>;
   clearError: () => void;
 } {
   const { session } = useAuth();
@@ -58,6 +61,19 @@ export function useGameSocket(gameId: string | null): {
           // never go backwards in version.
           if (previous.game && message.game.version < previous.game.version) return previous;
           return { ...previous, game: message.game, pending: false };
+        });
+        break;
+      }
+      case 'game.draw_offer_changed': {
+        // Offer transitions carry no snapshot: merge the pending offer into
+        // the state we already hold for this game.
+        setState((previous) => {
+          if (!previous.game || previous.game.id !== message.game_id) return previous;
+          return {
+            ...previous,
+            game: { ...previous.game, draw_offered_by: message.offered_by },
+            pending: false,
+          };
         });
         break;
       }
@@ -177,9 +193,39 @@ export function useGameSocket(gameId: string | null): {
     if (message.type !== 'error') apply(message);
   }, [send, apply, gameId]);
 
+  const offerDraw = useCallback(async () => {
+    if (!gameId) return;
+    const message = await send({
+      type: 'game.draw_offer',
+      command_id: newCommandId(),
+      game_id: gameId,
+    });
+    if (message.type !== 'error') apply(message);
+  }, [send, apply, gameId]);
+
+  const acceptDraw = useCallback(async () => {
+    if (!gameId) return;
+    const message = await send({
+      type: 'game.draw_accept',
+      command_id: newCommandId(),
+      game_id: gameId,
+    });
+    if (message.type !== 'error') apply(message);
+  }, [send, apply, gameId]);
+
+  const declineDraw = useCallback(async () => {
+    if (!gameId) return;
+    const message = await send({
+      type: 'game.draw_decline',
+      command_id: newCommandId(),
+      game_id: gameId,
+    });
+    if (message.type !== 'error') apply(message);
+  }, [send, apply, gameId]);
+
   const clearError = useCallback(() => {
     setState((previous) => ({ ...previous, lastError: null }));
   }, []);
 
-  return { state, move, resign, clearError };
+  return { state, move, resign, offerDraw, acceptDraw, declineDraw, clearError };
 }

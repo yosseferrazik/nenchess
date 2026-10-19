@@ -17,11 +17,13 @@ const REASON_LABELS: Record<ResultReasonDto, string> = {
   threefold_repetition: 'triple repetición',
   insufficient_material: 'material insuficiente',
   abandonment: 'abandono por ausencia',
+  agreement: 'acuerdo entre los jugadores',
 };
 
 export function GamePage({ gameId }: { gameId: string }) {
   const { session } = useAuth();
-  const { state, move, resign, clearError } = useGameSocket(gameId);
+  const { state, move, resign, offerDraw, acceptDraw, declineDraw, clearError } =
+    useGameSocket(gameId);
   const { game } = state;
   const [linkState, setLinkState] = useState<'idle' | 'copied' | 'failed'>('idle');
 
@@ -75,6 +77,14 @@ export function GamePage({ gameId }: { gameId: string }) {
 
           <aside className="side-panel">
             <StatusPanel game={game} myColor={myColor} />
+            <DrawPanel
+              game={game}
+              myColor={myColor}
+              pending={state.pending}
+              offerDraw={() => void offerDraw().catch(() => undefined)}
+              acceptDraw={() => void acceptDraw().catch(() => undefined)}
+              declineDraw={() => void declineDraw().catch(() => undefined)}
+            />
             <button type="button" className="secondary" onClick={() => void copyLink()}>
               {linkState === 'copied'
                 ? '¡enlace copiado!'
@@ -166,6 +176,55 @@ function StatusPanel({ game, myColor }: { game: GameView; myColor: 'white' | 'bl
         {game.increment_ms > 0 ? ` + ${Math.round(game.increment_ms / 1000)}s` : ''}
       </p>
     </div>
+  );
+}
+
+/** Offer, accept, decline or withdraw a draw — only for seated players. */
+function DrawPanel({
+  game,
+  myColor,
+  pending,
+  offerDraw,
+  acceptDraw,
+  declineDraw,
+}: {
+  game: GameView;
+  myColor: 'white' | 'black' | null;
+  pending: boolean;
+  offerDraw: () => void;
+  acceptDraw: () => void;
+  declineDraw: () => void;
+}) {
+  if (myColor === null || game.status !== 'active') return null;
+
+  if (game.draw_offered_by === myColor) {
+    return (
+      <div className="status-panel">
+        <strong>Oferta de tablas enviada</strong>
+        <p className="muted small">A la respuesta del rival… o retírala si te arrepientes.</p>
+        <button type="button" className="secondary" disabled={pending} onClick={declineDraw}>
+          Retirar la oferta
+        </button>
+      </div>
+    );
+  }
+  if (game.draw_offered_by !== null) {
+    return (
+      <div className="status-panel">
+        <strong>¡El rival propone tablas!</strong>
+        <button type="button" disabled={pending} onClick={acceptDraw}>
+          Aceptar tablas
+        </button>
+        <button type="button" className="secondary" disabled={pending} onClick={declineDraw}>
+          Rechazar
+        </button>
+      </div>
+    );
+  }
+  return (
+    <button type="button" className="secondary" disabled={pending} onClick={offerDraw}>
+      Proponer tablas
+    </button>
   );
 }
 
