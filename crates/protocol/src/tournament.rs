@@ -13,12 +13,25 @@ pub enum TournamentStatusDto {
     Finished,
 }
 
+/// Pairing system: everyone-plays-everyone, or score-grouped Swiss.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TournamentFormatDto {
+    /// Single round robin (the circle method).
+    #[default]
+    RoundRobin,
+    /// Fixed number of rounds (`ceil(log2(n))`), pairings by score.
+    Swiss,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct TournamentDto {
     pub id: Uuid,
     pub name: String,
     pub status: TournamentStatusDto,
+    pub format: TournamentFormatDto,
     #[ts(type = "number")]
     pub time_control_initial_ms: i64,
     #[ts(type = "number")]
@@ -50,6 +63,8 @@ pub struct CreateTournamentRequest {
     pub rated: bool,
     #[serde(default = "default_max_participants")]
     pub max_participants: i32,
+    #[serde(default)]
+    pub format: TournamentFormatDto,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

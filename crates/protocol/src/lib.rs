@@ -19,7 +19,7 @@ pub mod tournament;
 
 pub use tournament::{
     CreateTournamentRequest, PairingDto, ParticipantDto, RoundDto, TournamentDto,
-    TournamentStatusDto, TournamentView, TournamentsResponse,
+    TournamentFormatDto, TournamentStatusDto, TournamentView, TournamentsResponse,
 };
 
 /// Current protocol version. Bump on breaking changes and coordinate with the

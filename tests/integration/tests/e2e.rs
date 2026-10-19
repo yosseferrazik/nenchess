@@ -451,6 +451,7 @@ async fn end_to_end() -> anyhow::Result<()> {
     skill_matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
     tournament_scenario(&api).await?;
+    swiss_tournament_scenario(&api).await?;
     ops_scenarios(&api).await?;
     cookie_scenarios(&api).await?;
     // Must run last: it deliberately exhausts the per-IP auth budget that
@@ -1590,6 +1591,7 @@ async fn create_tournament(
     token: &str,
     name: &str,
     max_participants: i32,
+    format: &str,
 ) -> anyhow::Result<protocol::TournamentDto> {
     let (status, body) = api
         .post(
@@ -1601,6 +1603,7 @@ async fn create_tournament(
                 "time_control_increment_ms": 0,
                 "rated": false,
                 "max_participants": max_participants,
+                "format": format,
             }),
         )
         .await?;
@@ -1710,7 +1713,7 @@ async fn tournament_scenario(api: &Api) -> anyhow::Result<()> {
     let two = register(api, &TestUser::new("trn_two")).await?;
 
     // An empty tournament cannot be started: there is nobody to pair.
-    let lonely = create_tournament(api, &organizer.token, "Solitaire", 4).await?;
+    let lonely = create_tournament(api, &organizer.token, "Solitaire", 4, "round_robin").await?;
     let (status, body) = api
         .post(
             &format!("/api/tournaments/{}/start", lonely.id),
@@ -1747,8 +1750,10 @@ async fn tournament_scenario(api: &Api) -> anyhow::Result<()> {
     );
 
     // A real three-player round robin.
-    let created = create_tournament(api, &organizer.token, "Copa NenChess", 8).await?;
+    let created =
+        create_tournament(api, &organizer.token, "Copa NenChess", 8, "round_robin").await?;
     assert_eq!(created.status, protocol::TournamentStatusDto::Registration);
+    assert_eq!(created.format, protocol::TournamentFormatDto::RoundRobin);
     assert_eq!(created.current_round, 0);
     assert_eq!(created.total_rounds, 0);
     assert_eq!(created.created_by, organizer.user.id);
@@ -1974,6 +1979,138 @@ async fn tournament_scenario(api: &Api) -> anyhow::Result<()> {
         status == StatusCode::BAD_REQUEST,
         "a finished tournament must refuse new entrants, got {status}"
     );
+
+    Ok(())
+}
+
+/// Swiss pairing end to end: seeded round 1, score-based lazy rounds, byes,
+/// standings and finish — all through the public API.
+async fn swiss_tournament_scenario(api: &Api) -> anyhow::Result<()> {
+    let organizer = register(api, &TestUser::new("sw_org")).await?;
+    let strong = register(api, &TestUser::new("sw_strong")).await?;
+    let weak = register(api, &TestUser::new("sw_weak")).await?;
+
+    // An unknown format never reaches the domain: serde rejects it (axum's
+    // JSON rejection answers 422 before any handler runs).
+    let (status, _) = api
+        .post(
+            "/api/tournaments",
+            Some(&organizer.token),
+            json!({ "name": "Kaboom", "format": "kaboom", "max_participants": 4 }),
+        )
+        .await?;
+    anyhow::ensure!(
+        status == StatusCode::UNPROCESSABLE_ENTITY,
+        "an unknown format must be rejected, got {status}"
+    );
+
+    // Stage distinct ratings so the seeding is deterministic: strong (1800)
+    // > weak (1600) > organizer (1500, the default).
+    let mut conn = stage_db().await?;
+    for (user_id, rating) in [(strong.user.id, 1800), (weak.user.id, 1600)] {
+        sqlx::query(
+            "UPDATE player_ratings SET rating = $2 WHERE user_id = $1 AND category = 'rapid'",
+        )
+        .bind(user_id)
+        .bind(rating)
+        .execute(&mut conn)
+        .await?;
+    }
+
+    // 10+0 is the rapid ladder the snapshots above were staged on.
+    let created = create_tournament(api, &organizer.token, "Suizo NenChess", 4, "swiss").await?;
+    assert_eq!(created.format, protocol::TournamentFormatDto::Swiss);
+    join_tournament(api, &strong.token, created.id).await?;
+    join_tournament(api, &weak.token, created.id).await?;
+
+    // Three players, ceil(log2(3)) = 2 rounds.
+    start_tournament(api, &organizer.token, created.id).await?;
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(
+        view.tournament.status,
+        protocol::TournamentStatusDto::Active
+    );
+    assert_eq!(view.tournament.format, protocol::TournamentFormatDto::Swiss);
+    assert_eq!(view.tournament.current_round, 1);
+    assert_eq!(view.tournament.total_rounds, 2);
+
+    // Round 1 seeds top-half vs bottom-half: strong (1800) plays weak (1600)
+    // — top seed white — while the organizer rests with the bye.
+    let round1 = view
+        .rounds
+        .iter()
+        .find(|r| r.round_number == 1)
+        .context("round 1 must exist")?;
+    anyhow::ensure!(round1.pairings.len() == 2, "one game and one bye");
+    let game1 = round1
+        .pairings
+        .iter()
+        .find(|p| !p.bye)
+        .context("the seeded game")?;
+    assert_eq!(game1.white_id, Some(strong.user.id));
+    assert_eq!(game1.black_id, Some(weak.user.id));
+    let bye1 = round1.pairings.iter().find(|p| p.bye).context("one bye")?;
+    assert_eq!(bye1.white_id, Some(organizer.user.id));
+    assert_eq!(bye1.result.as_deref(), Some("bye"));
+    assert_eq!(standing_for(&view, organizer.user.id).unwrap().points, 1.0);
+
+    // strong wins the seeded game → round 2 pairs by score: the 1-point
+    // organizer (fewer whites, bye excluded) faces the 1-point strong, and
+    // the loser rests with the second bye.
+    let game1_id = game1.game_id.context("seeded game id")?;
+    let winner = resign_tournament_game(api, &weak.token, game1_id).await?;
+    assert_eq!(winner, strong.user.id);
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(view.tournament.current_round, 2, "round 2 pairs on demand");
+    let round2 = view
+        .rounds
+        .iter()
+        .find(|r| r.round_number == 2)
+        .context("round 2 must exist")?;
+    anyhow::ensure!(round2.pairings.len() == 2, "one game and one bye");
+    let game2 = round2
+        .pairings
+        .iter()
+        .find(|p| !p.bye)
+        .context("the score-based game")?;
+    assert_eq!(
+        game2.white_id,
+        Some(organizer.user.id),
+        "fewer whites draws white"
+    );
+    assert_eq!(game2.black_id, Some(strong.user.id));
+    let bye2 = round2.pairings.iter().find(|p| p.bye).context("one bye")?;
+    assert_eq!(bye2.white_id, Some(weak.user.id));
+    assert_eq!(
+        bye2.result.as_deref(),
+        Some("bye"),
+        "the bye scores immediately"
+    );
+
+    // The last decisive game finishes the tournament.
+    let game2_id = game2.game_id.context("round 2 game id")?;
+    let winner = resign_tournament_game(api, &organizer.token, game2_id).await?;
+    assert_eq!(winner, strong.user.id);
+    let view = get_tournament(api, &organizer.token, created.id).await?;
+    assert_eq!(
+        view.tournament.status,
+        protocol::TournamentStatusDto::Finished
+    );
+
+    // Standings: strong sweeps both games (2.0); the two 1-point players are
+    // separated by the rating tiebreak (weak 1600 > organizer 1500).
+    assert_eq!(view.standings.len(), 3);
+    assert_eq!(view.standings[0].user_id, strong.user.id);
+    assert_eq!(view.standings[0].points, 2.0);
+    assert_eq!(view.standings[0].games_played, 2);
+    assert_eq!(view.standings[1].user_id, weak.user.id);
+    assert_eq!(view.standings[2].user_id, organizer.user.id);
+    for pair in view.standings.windows(2) {
+        assert!(
+            pair[0].points >= pair[1].points,
+            "standings must be ordered by points"
+        );
+    }
 
     Ok(())
 }

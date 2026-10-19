@@ -21,6 +21,7 @@ pub async fn create(
         req.time_control_increment_ms,
         req.rated,
         req.max_participants,
+        req.format,
         user.0.id,
     )
     .await?;

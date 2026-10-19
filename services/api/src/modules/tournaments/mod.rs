@@ -1,10 +1,13 @@
-//! Tournaments (stage 05): creation, joining, round-robin pairing, and
-//! settlement.
+//! Tournaments (stage 05): creation, joining, pairing and settlement.
 //!
-//! Scope of the first slice:
+//! Scope of this slice:
 //! * **Round-robin** format. A single group plays everyone else once; the
 //!   schedule is generated with the circle method (a bye is handed to an odd
 //!   player each round).
+//! * **Swiss** format. `ceil(log2(n))` rounds; round 1 seeds the top half
+//!   against the bottom half, later rounds are paired lazily (simplified
+//!   Dutch) from the standings the moment the previous round is fully
+//!   decided, preferring opponents nobody has faced yet and balancing colours.
 //! * Lifecycle: `registration` → `active` → `finished`.
 //! * `start` freezes the roster and emits the pairings; each pairing becomes a
 //!   real `games` row so the existing authoritative move pipeline (clocks,
@@ -16,11 +19,11 @@
 //! The server is the only authority: clients join, start (creator only) and
 //! play; they never report a score.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use protocol::{
-    PairingDto, ParticipantDto, RoundDto, TournamentDto, TournamentStatusDto, TournamentView,
-    TournamentsResponse,
+    PairingDto, ParticipantDto, RoundDto, TournamentDto, TournamentFormatDto, TournamentStatusDto,
+    TournamentView, TournamentsResponse,
 };
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -35,6 +38,7 @@ pub(crate) struct TournamentRow {
     id: Uuid,
     name: String,
     status: String,
+    format: String,
     time_control_initial_ms: i64,
     time_control_increment_ms: i64,
     rated: bool,
@@ -77,6 +81,10 @@ pub(crate) fn row_to_dto(r: TournamentRow) -> TournamentDto {
             "finished" => TournamentStatusDto::Finished,
             _ => TournamentStatusDto::Registration,
         },
+        format: match r.format.as_str() {
+            "swiss" => TournamentFormatDto::Swiss,
+            _ => TournamentFormatDto::RoundRobin,
+        },
         time_control_initial_ms: r.time_control_initial_ms,
         time_control_increment_ms: r.time_control_increment_ms,
         rated: r.rated,
@@ -90,8 +98,15 @@ pub(crate) fn row_to_dto(r: TournamentRow) -> TournamentDto {
     }
 }
 
-const TOURNAMENT_COLUMNS: &str = "id, name, status, time_control_initial_ms, time_control_increment_ms, \
+const TOURNAMENT_COLUMNS: &str = "id, name, status, format, time_control_initial_ms, time_control_increment_ms, \
      rated, max_participants, current_round, total_rounds, created_by, started_at, finished_at, created_at";
+
+fn format_str(format: TournamentFormatDto) -> &'static str {
+    match format {
+        TournamentFormatDto::RoundRobin => "round_robin",
+        TournamentFormatDto::Swiss => "swiss",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pairing (pure)
@@ -140,6 +155,111 @@ pub fn round_robin_schedule(n: usize) -> Vec<Vec<Pairing>> {
     schedule
 }
 
+/// A player's Swiss résumé entering a round.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SwissPlayer {
+    pub user_id: Uuid,
+    pub points: f64,
+    pub rating: i32,
+    /// Games played with the white pieces (byes excluded).
+    pub whites: i32,
+}
+
+/// One Swiss pairing: a game, or — when `black` is `None` — a bye that scores
+/// for `white`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwissPairing {
+    pub white: Uuid,
+    pub black: Option<Uuid>,
+}
+
+/// Swiss round 1 by seeding: the top half plays the bottom half in order
+/// (colours alternating), and an odd field rests the lowest seed.
+pub fn swiss_opening_round(n: usize) -> Vec<Pairing> {
+    if n < 2 {
+        return Vec::new();
+    }
+    let odd = n % 2 == 1;
+    let active = n - usize::from(odd);
+    let half = active / 2;
+    let mut round: Vec<Pairing> = (0..half)
+        .map(|i| {
+            let (top, bottom) = (i, half + i);
+            let (white, black) = if i % 2 == 0 {
+                (top, bottom)
+            } else {
+                (bottom, top)
+            };
+            Pairing {
+                white: Some(white),
+                black: Some(black),
+            }
+        })
+        .collect();
+    if odd {
+        // The lowest seed rests and scores a point.
+        round.push(Pairing {
+            white: Some(n - 1),
+            black: None,
+        });
+    }
+    round
+}
+
+/// Swiss plays enough rounds for a field of `n` to separate into a single
+/// leader: `ceil(log2(n))` (2 → 1, 3 → 2, 5 → 3, 8 → 3).
+pub fn swiss_total_rounds(n: usize) -> i32 {
+    if n < 2 {
+        return 0;
+    }
+    (u32::BITS - (n as u32 - 1).leading_zeros()) as i32
+}
+
+/// A later Swiss round (simplified Dutch): players ordered by score, then
+/// rating, pair adjacently, preferring opponents they have never faced;
+/// colours go to whoever has played fewer whites (ties: the higher-ranked
+/// player). The leftover in an odd field takes the bye. When every remaining
+/// candidate has already faced the anchor — possible only in tiny fields — a
+/// rematch is the only way to keep the round whole.
+pub fn swiss_round(players: &[SwissPlayer], history: &HashSet<(Uuid, Uuid)>) -> Vec<SwissPairing> {
+    let mut remaining: Vec<SwissPlayer> = players.to_vec();
+    remaining.sort_by(|a, b| {
+        b.points
+            .partial_cmp(&a.points)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.rating.cmp(&a.rating))
+            .then(a.user_id.cmp(&b.user_id))
+    });
+
+    let mut round = Vec::with_capacity(remaining.len().div_ceil(2));
+    while !remaining.is_empty() {
+        let anchor = remaining.remove(0);
+        if remaining.is_empty() {
+            round.push(SwissPairing {
+                white: anchor.user_id,
+                black: None,
+            });
+            break;
+        }
+        let met = |p: &SwissPlayer| (anchor.user_id.min(p.user_id), anchor.user_id.max(p.user_id));
+        let opponent = remaining
+            .iter()
+            .position(|p| !history.contains(&met(p)))
+            .unwrap_or(0);
+        let challenger = remaining.remove(opponent);
+        let (white, black) = if anchor.whites <= challenger.whites {
+            (anchor.user_id, challenger.user_id)
+        } else {
+            (challenger.user_id, anchor.user_id)
+        };
+        round.push(SwissPairing {
+            white,
+            black: Some(black),
+        });
+    }
+    round
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -152,6 +272,7 @@ pub async fn create_tournament(
     time_control_increment_ms: i64,
     rated: bool,
     max_participants: i32,
+    format: TournamentFormatDto,
     created_by: Uuid,
 ) -> Result<TournamentDto, ApiError> {
     if name.trim().is_empty() || name.len() > 64 {
@@ -177,12 +298,13 @@ pub async fn create_tournament(
 
     let id = Uuid::new_v4();
     let row = sqlx::query_as::<_, TournamentRow>(&format!(
-        "INSERT INTO tournaments (id, name, status, time_control_initial_ms, time_control_increment_ms, rated, max_participants, current_round, total_rounds, created_by) \
-         VALUES ($1, $2, 'registration', $3, $4, $5, $6, 0, 0, $7) \
+        "INSERT INTO tournaments (id, name, status, format, time_control_initial_ms, time_control_increment_ms, rated, max_participants, current_round, total_rounds, created_by) \
+         VALUES ($1, $2, 'registration', $3, $4, $5, $6, $7, 0, 0, $8) \
          RETURNING {TOURNAMENT_COLUMNS}",
     ))
     .bind(id)
     .bind(name)
+    .bind(format_str(format))
     .bind(time_control_initial_ms)
     .bind(time_control_increment_ms)
     .bind(rated)
@@ -281,10 +403,13 @@ pub async fn join_tournament(
     Ok(())
 }
 
-/// Freeze the roster, generate the round-robin schedule and open round 1.
+/// Freeze the roster, generate the schedule and open round 1.
 ///
-/// Creator-only. Every non-bye pairing becomes an authoritative `games` row so
-/// the normal move pipeline runs; byes are awarded immediately.
+/// Creator-only. Round-robin generates the full circle schedule upfront;
+/// Swiss seeds round 1 (top half vs bottom half) and pairs the remaining
+/// `ceil(log2(n)) - 1` rounds lazily as results land. Every non-bye pairing
+/// becomes an authoritative `games` row so the normal move pipeline runs; byes
+/// are awarded immediately.
 pub async fn start_tournament(
     conn: &mut PgConnection,
     tournament_id: Uuid,
@@ -308,8 +433,9 @@ pub async fn start_tournament(
         return Err(ApiError::bad_request("tournament already started"));
     }
 
-    // Roster ordered by rating (desc) so the circle method spreads strong
-    // players; ties broken by user_id for a deterministic schedule.
+    // Roster ordered by rating (desc) so the circle method and the Swiss
+    // seeding spread strong players; ties broken by user_id for a
+    // deterministic schedule.
     let roster = sqlx::query_scalar::<_, Uuid>(
         "SELECT user_id FROM tournament_participants WHERE tournament_id = $1 \
          ORDER BY rating_snapshot DESC, user_id",
@@ -323,8 +449,17 @@ pub async fn start_tournament(
         ));
     }
 
-    let schedule = round_robin_schedule(roster.len());
-    let total_rounds = schedule.len() as i32;
+    // Round-robin pre-generates every round; Swiss opens only the seeded
+    // first round and pairs the rest on demand.
+    let schedule: Vec<Vec<Pairing>> = match t.format.as_str() {
+        "swiss" => vec![swiss_opening_round(roster.len())],
+        _ => round_robin_schedule(roster.len()),
+    };
+    let total_rounds = if t.format == "swiss" {
+        swiss_total_rounds(roster.len())
+    } else {
+        schedule.len() as i32
+    };
 
     for (idx, round) in schedule.iter().enumerate() {
         let round_number = (idx + 1) as i32;
@@ -630,6 +765,13 @@ async fn advance_if_round_complete(conn: &mut PgConnection, game: &Game) -> Resu
         return Ok(());
     }
 
+    // Swiss pairs on demand: the next round's matchups only exist once the
+    // previous one is fully decided. The tournament row is locked above, so
+    // the generation runs exactly once per round.
+    if t.format == "swiss" {
+        generate_swiss_round(conn, tournament_id, next_round).await?;
+    }
+
     // Open the next round: attach a game to each undecided (non-bye) pairing.
     let pending = sqlx::query_as::<_, PairingRow>(
         "SELECT id, tournament_id, round_number, white_id, black_id, game_id, bye, result \
@@ -675,6 +817,87 @@ async fn advance_if_round_complete(conn: &mut PgConnection, game: &Game) -> Resu
         .execute(&mut *conn)
         .await?;
     tracing::info!(tournament = %tournament_id, round = next_round, "tournament round advanced");
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SwissRow {
+    user_id: Uuid,
+    rating_snapshot: i32,
+    points: f64,
+}
+
+/// Pair and insert the next Swiss round from the standings so far. The rows
+/// land with `game_id IS NULL` and undecided results; the shared open-the-round
+/// loop right after attaches the games and scores the byes, exactly as if the
+/// round had been pre-generated like a round robin.
+async fn generate_swiss_round(
+    conn: &mut PgConnection,
+    tournament_id: Uuid,
+    round_number: i32,
+) -> Result<(), ApiError> {
+    let players = sqlx::query_as::<_, SwissRow>(
+        "SELECT user_id, rating_snapshot, points FROM tournament_participants \
+         WHERE tournament_id = $1",
+    )
+    .bind(tournament_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Every earlier pairing is decided by construction (we only advance once
+    // the current round has no undecided row). Byes carry no colours; every
+    // other result feeds the score, colour and rematch bookkeeping.
+    let prior = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT white_id, black_id FROM tournament_pairings \
+         WHERE tournament_id = $1 AND bye = false \
+           AND white_id IS NOT NULL AND black_id IS NOT NULL",
+    )
+    .bind(tournament_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut history = HashSet::new();
+    let mut whites: HashMap<Uuid, i32> = HashMap::new();
+    for (white, black) in prior {
+        *whites.entry(white).or_default() += 1;
+        history.insert((white.min(black), white.max(black)));
+    }
+
+    let roster: Vec<SwissPlayer> = players
+        .into_iter()
+        .map(|p| SwissPlayer {
+            user_id: p.user_id,
+            points: p.points,
+            rating: p.rating_snapshot,
+            whites: whites.get(&p.user_id).copied().unwrap_or(0),
+        })
+        .collect();
+
+    let round_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tournament_rounds (id, tournament_id, round_number, started_at) \
+         VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(round_id)
+    .bind(tournament_id)
+    .bind(round_number)
+    .execute(&mut *conn)
+    .await?;
+
+    for pairing in swiss_round(&roster, &history) {
+        sqlx::query(
+            "INSERT INTO tournament_pairings (id, tournament_id, round_id, round_number, white_id, black_id, game_id, bye, result) \
+             VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, NULL)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tournament_id)
+        .bind(round_id)
+        .bind(round_number)
+        .bind(pairing.white)
+        .bind(pairing.black)
+        .bind(pairing.black.is_none())
+        .execute(&mut *conn)
+        .await?;
+    }
     Ok(())
 }
 
@@ -778,5 +1001,125 @@ mod tests {
             anchor_colours.windows(2).any(|w| w[0] != w[1]),
             "anchor must not always be white"
         );
+    }
+
+    #[test]
+    fn swiss_rounds_cover_a_doubling_field() {
+        assert_eq!(swiss_total_rounds(0), 0);
+        assert_eq!(swiss_total_rounds(1), 0);
+        assert_eq!(swiss_total_rounds(2), 1);
+        assert_eq!(swiss_total_rounds(3), 2);
+        assert_eq!(swiss_total_rounds(4), 2);
+        assert_eq!(swiss_total_rounds(5), 3);
+        assert_eq!(swiss_total_rounds(8), 3);
+        assert_eq!(swiss_total_rounds(9), 4);
+    }
+
+    #[test]
+    fn swiss_opening_splits_the_halves_and_rests_the_lowest_seed() {
+        let round = swiss_opening_round(4);
+        assert_eq!(round.len(), 2);
+        for p in &round {
+            let (white, black) = (p.white.expect("seeded pair"), p.black.expect("seeded pair"));
+            // A top-half seed (0,1) always meets a bottom-half seed (2,3).
+            assert_eq!(white < 2, black >= 2, "halves must clash, never within");
+        }
+
+        let round = swiss_opening_round(3);
+        let bye = round
+            .iter()
+            .find(|p| p.black.is_none())
+            .expect("odd field rests someone");
+        assert_eq!(bye.white, Some(2), "the lowest seed takes the bye");
+        assert_eq!(
+            round.iter().filter(|p| p.black.is_some()).count(),
+            1,
+            "the other two play"
+        );
+
+        assert!(swiss_opening_round(1).is_empty());
+    }
+
+    #[test]
+    fn swiss_round_pairs_by_score_avoids_rematches_and_balances_colours() {
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let players = vec![
+            SwissPlayer {
+                user_id: a,
+                points: 3.0,
+                rating: 1600,
+                whites: 1,
+            },
+            SwissPlayer {
+                user_id: b,
+                points: 3.0,
+                rating: 1550,
+                whites: 0,
+            },
+            SwissPlayer {
+                user_id: c,
+                points: 1.0,
+                rating: 1500,
+                whites: 0,
+            },
+            SwissPlayer {
+                user_id: d,
+                points: 0.0,
+                rating: 1500,
+                whites: 1,
+            },
+        ];
+
+        // Everyone meets everyone on a clean slate: adjacent score pairs.
+        let round = swiss_round(&players, &HashSet::new());
+        assert_eq!(round.len(), 2);
+        let pairs: Vec<(Uuid, Uuid)> = round
+            .iter()
+            .map(|p| {
+                let (w, b) = (p.white, p.black.expect("clean slate has no byes"));
+                (w.min(b), w.max(b))
+            })
+            .collect();
+        assert!(
+            pairs.contains(&(a.min(b), a.max(b))),
+            "leaders meet first: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(c.min(d), c.max(d))),
+            "chasers meet first: {pairs:?}"
+        );
+
+        // The leaders already met: the anchors drop to the nearest opponent
+        // they have not faced, and colours follow the white counts.
+        let mut history = HashSet::new();
+        history.insert((a.min(b), a.max(b)));
+        let round = swiss_round(&players, &history);
+        let ac = round
+            .iter()
+            .find(|p| p.black == Some(a) || p.black == Some(c))
+            .expect("a pairs with c");
+        assert!(
+            (ac.white == a && ac.black == Some(c)) || (ac.white == c && ac.black == Some(a)),
+            "the leaders fall through to c: {ac:?}"
+        );
+        assert_eq!(
+            ac.white, c,
+            "c has played fewer whites and takes the colour"
+        );
+        assert!(
+            round.iter().any(|p| p.black == Some(d)),
+            "b pairs with the remaining chaser"
+        );
+
+        // Odd leftover takes the bye.
+        let round = swiss_round(&players[..3], &history);
+        let bye = round.iter().find(|p| p.black.is_none()).expect("a bye");
+        // Score order: a, b, c — a pairs with c (b is met), b rests.
+        assert_eq!(bye.white, b);
     }
 }
