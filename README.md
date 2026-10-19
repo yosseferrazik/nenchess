@@ -61,16 +61,19 @@ end-to-end tests.
   server-side when a rated game ends; K-factors 32/16/8 (FIDE-style tiers) and
   a rating history appended in the same transaction as the result.
 - **Tournaments** — round-robin groups generated with the circle method (byes
-  for odd fields), creator-driven start, pairings that become real `games` rows
-  so the authoritative move pipeline applies unchanged, and standings (points →
-  Buchholz → rating) settled atomically as games finish.
+  for odd fields) or **Swiss** (`ceil(log2(n))` rounds: a seeded first round,
+  then simplified-Dutch pairings generated the moment the previous round is
+  fully decided, rematch-averse with colour balancing), creator-driven start,
+  pairings that become real `games` rows so the authoritative move pipeline
+  applies unchanged, and standings (points → Buchholz → rating) settled
+  atomically as games finish.
 - **The hard parts, from day one** — optimistic versioning, idempotent
   commands, atomic persistence with a transactional outbox, resumable
   snapshots.
 - **Frontend** — auth, lobby with matchmaking and invite links, a board with
   clocks, move list, promotion picker, spectator mode, automatic
   reconnection, profile history with PGN downloads, and tournament
-  create/join/start with live standings.
+  create (round-robin or Swiss)/join/start with live standings.
 
 Deliberately **not** built yet: claim-based (rather than automatic) draws,
 email, push,
@@ -279,7 +282,7 @@ cargo test --workspace
 # End-to-end: spawns the real server against a `nenchess_test` database and
 # drives it over HTTP and WebSocket (idempotency, version conflicts, races,
 # flag fall, resignation, draw offers, PGN export & history, spectators,
-# skill-based matchmaking, tournaments, ops probes,
+# skill-based matchmaking, round-robin & Swiss tournaments, ops probes,
 # cookie/CSRF
 # lifecycle, rate-limit 429)
 cargo test -p nenchess-integration --test e2e -- --nocapture
@@ -316,8 +319,9 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 3. **Game domain & persistence** — ✅ move pipeline, clocks, results, atomicity.
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
-5. **Platform growth** — ✅ ratings, tournaments, skill-based matchmaking,
-   draw offers with automatic draw detection, PGN export & game history.
+5. **Platform growth** — ✅ ratings, round-robin & Swiss tournaments,
+   skill-based matchmaking, draw offers with automatic draw detection, PGN
+   export & game history.
 
 ## Known limitations
 
