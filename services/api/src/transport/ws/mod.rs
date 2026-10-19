@@ -5,8 +5,12 @@
 //! (idempotency) and moves carry `expected_version` (optimistic concurrency);
 //! the client only ever expresses intent.
 
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -22,23 +26,34 @@ use crate::application::{moves, MoveCommand, ResignCommand};
 use crate::bootstrap::AppState;
 use crate::error::ApiError;
 use crate::modules::{games as games_module, identity};
+use crate::transport::http::session_cookie;
 
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
-    token: String,
+    /// API clients authenticate with `?token=…`; browsers rely on the
+    /// `nenchess_session` cookie sent with the same-origin handshake.
+    token: Option<String>,
 }
 
-/// `GET /ws?token=…` — bearer token in the query string because browsers
-/// cannot set headers on WebSocket handshakes. (A production deployment would
-/// prefer a short-lived ticket or a secure cookie.)
+/// `GET /ws` — authenticates from `?token=…` or the session cookie.
 pub async fn upgrade(
     State(state): State<AppState>,
     Query(params): Query<WsParams>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let user = identity::resolve_session(&state.db, &params.token)
+    let token = params
+        .token
+        .filter(|token| !token.is_empty())
+        .or_else(|| session_cookie(&headers))
+        .ok_or_else(ApiError::unauthorized)?;
+    let user = identity::resolve_session(&state.db, &token)
         .await?
         .ok_or_else(ApiError::unauthorized)?;
+    state
+        .metrics
+        .ws_connections_total
+        .fetch_add(1, Ordering::Relaxed);
     Ok(ws
         .on_upgrade(move |socket| handle_socket(state, user, socket))
         .into_response())
@@ -48,7 +63,15 @@ async fn handle_socket(state: AppState, user: UserDto, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let conn_id = Uuid::new_v4();
+    state.metrics.ws_connections.fetch_add(1, Ordering::Relaxed);
     tracing::debug!(user = %user.username, conn = %conn_id, "websocket connected");
+
+    // Per-connection command budget: even without a matching game a client
+    // could otherwise spam commands (each illegal move would still reach
+    // the validation path).
+    let command_limit = state.config.rate_limit_ws_per_minute;
+    let mut command_window_start = Instant::now();
+    let mut command_count = 0u32;
 
     loop {
         tokio::select! {
@@ -61,6 +84,22 @@ async fn handle_socket(state: AppState, user: UserDto, socket: WebSocket) {
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
+                        if command_limit > 0 {
+                            if command_window_start.elapsed() >= Duration::from_secs(60) {
+                                command_window_start = Instant::now();
+                                command_count = 0;
+                            }
+                            command_count += 1;
+                            if command_count > command_limit {
+                                state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                let _ = out_tx.send(ServerMessage::Error {
+                                    command_id: None,
+                                    code: ErrorCode::RateLimited,
+                                    message: "too many commands, slow down".to_string(),
+                                });
+                                continue;
+                            }
+                        }
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
                             Ok(command) => {
                                 handle_command(&state, &user, conn_id, command, &out_tx).await;
@@ -108,6 +147,7 @@ async fn handle_socket(state: AppState, user: UserDto, socket: WebSocket) {
             },
         );
     }
+    state.metrics.ws_connections.fetch_sub(1, Ordering::Relaxed);
     tracing::debug!(user = %user.username, conn = %conn_id, "websocket disconnected");
 }
 

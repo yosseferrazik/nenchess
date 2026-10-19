@@ -58,6 +58,16 @@ pub async fn spawn_server() -> anyhow::Result<String> {
         matchmaking_interval_ms: 50,
         session_ttl_days: 1,
         rust_log: "info".to_string(),
+        // Headroom for every scenario's register/login calls plus the final
+        // rate-limit hammer, which runs last and expects a 429.
+        rate_limit_auth_per_minute: 60,
+        // Disabled: polling loops would otherwise share one per-user bucket.
+        rate_limit_api_per_minute: 0,
+        // Generous: scenarios burst commands but stay well under this.
+        rate_limit_ws_per_minute: 120,
+        cookie_secure: false,
+        trust_proxy_headers: false,
+        allowed_origins: vec!["http://localhost:5173".to_string()],
     };
 
     let state = build_state(config).await?;
@@ -69,7 +79,9 @@ pub async fn spawn_server() -> anyhow::Result<String> {
     let addr = listener.local_addr()?;
     let router = build_router(state);
     tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
+        // Connect info feeds the per-IP auth rate limiter, as in production.
+        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(err) = axum::serve(listener, service).await {
             eprintln!("server error: {err}");
         }
     });
@@ -80,4 +92,9 @@ pub async fn spawn_server() -> anyhow::Result<String> {
 /// WebSocket URL for the given base URL and session token.
 pub fn ws_url(base: &str, token: &str) -> String {
     base.replacen("http://", "ws://", 1) + &format!("/ws?token={token}")
+}
+
+/// Token-less WebSocket URL, for cookie-authenticated handshakes.
+pub fn ws_url_plain(base: &str) -> String {
+    base.replacen("http://", "ws://", 1) + "/ws"
 }

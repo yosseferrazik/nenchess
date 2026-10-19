@@ -1,8 +1,9 @@
-//! Identity: registration, login and session resolution.
+//! Identity: registration, login, logout and session resolution.
 //!
 //! Passwords are hashed with Argon2id (`argon2id$<salt>$<hash>`); sessions
-//! are opaque random tokens stored server-side with an expiry. The client
-//! sends the token as `Authorization: Bearer …` (WebSocket: `?token=`).
+//! are opaque random tokens stored server-side with an expiry. Browsers
+//! receive the token in an `HttpOnly` `SameSite=Lax` cookie; API clients
+//! send it as `Authorization: Bearer …` (WebSocket: `?token=` or cookie).
 
 use argon2::Argon2;
 use chrono::{Duration, Utc};
@@ -98,6 +99,14 @@ pub async fn resolve_session(pool: &PgPool, token: &str) -> Result<Option<UserDt
         id: r.id,
         username: r.username,
     }))
+}
+
+/// Revoke a session token (logout). Revoking an unknown or expired token is
+/// a no-op: the client already lost access.
+pub async fn logout(pool: &PgPool, token: &str) -> Result<(), ApiError> {
+    let mut conn = pool.acquire().await?;
+    users::delete_session(&mut conn, token).await?;
+    Ok(())
 }
 
 async fn open_session(

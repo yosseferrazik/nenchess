@@ -41,6 +41,10 @@ pub async fn create_game(
 
     let mut conn = state.db.acquire().await?;
     repo::insert(&mut conn, &game).await?;
+    state
+        .metrics
+        .games_created
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     views::game_view(&mut conn, &game, now).await
 }
 

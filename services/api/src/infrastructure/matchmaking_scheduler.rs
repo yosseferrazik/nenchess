@@ -16,7 +16,13 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match matchmaking::drain_pairs(&state).await {
-                Ok(n) if n > 0 => tracing::info!(paired = n, "matchmaking paired games"),
+                Ok(n) if n > 0 => {
+                    state
+                        .metrics
+                        .matchmaking_pairs
+                        .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(paired = n, "matchmaking paired games");
+                }
                 Ok(_) => {}
                 Err(err) => tracing::error!(error = %err, "matchmaking pass failed"),
             }

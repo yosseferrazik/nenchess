@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use protocol::{ErrorCode, ErrorDto, ServerMessage};
@@ -15,6 +15,8 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub status: StatusCode,
     pub message: String,
+    /// `Retry-After` hint for429 responses, in seconds.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
@@ -23,6 +25,7 @@ impl ApiError {
             code,
             status: status_for(code),
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -55,6 +58,17 @@ impl ApiError {
         Self::from_code(ErrorCode::Internal, message)
     }
 
+    /// 429 with a `Retry-After` hint (seconds until the fixed window resets).
+    pub fn rate_limited(retry_after_secs: u64) -> Self {
+        Self {
+            retry_after_secs: Some(retry_after_secs.max(1)),
+            ..Self::from_code(
+                ErrorCode::RateLimited,
+                format!("too many requests, retry in {}s", retry_after_secs.max(1)),
+            )
+        }
+    }
+
     /// Wire representation used by the WebSocket layer.
     pub fn to_ws_message(&self, command_id: Option<Uuid>) -> ServerMessage {
         ServerMessage::Error {
@@ -70,14 +84,21 @@ impl IntoResponse for ApiError {
         if self.status.is_server_error() {
             tracing::error!(code = ?self.code, message = %self.message, "request failed");
         }
-        (
+        let retry_after = self
+            .retry_after_secs
+            .and_then(|secs| HeaderValue::from_str(&secs.to_string()).ok());
+        let mut response = (
             self.status,
             Json(ErrorDto {
                 code: self.code,
                 message: self.message,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 

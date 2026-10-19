@@ -114,6 +114,10 @@ pub async fn submit_move(
     {
         CommitOutcome::Committed => {
             tx.commit().await?;
+            state
+                .metrics
+                .moves_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 game = %cmd.game_id,
                 version = message_version(&message),
@@ -169,6 +173,10 @@ pub async fn submit_resign(
     {
         CommitOutcome::Committed => {
             tx.commit().await?;
+            state
+                .metrics
+                .moves_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(message)
         }
         CommitOutcome::Replayed(stored) => {

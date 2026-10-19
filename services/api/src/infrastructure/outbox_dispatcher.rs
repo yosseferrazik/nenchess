@@ -47,5 +47,10 @@ async fn dispatch_once(state: &AppState) -> Result<(), sqlx::Error> {
         ids.push(row.id);
     }
     super::repos::outbox::mark_dispatched(&mut tx, &ids).await?;
-    tx.commit().await
+    tx.commit().await?;
+    state
+        .metrics
+        .outbox_published
+        .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }

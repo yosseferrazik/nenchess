@@ -135,3 +135,12 @@ pub async fn session_user(
     .fetch_optional(conn)
     .await
 }
+
+/// Revoke a session token (logout). Unknown tokens are a no-op.
+pub async fn delete_session(conn: &mut PgConnection, token: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM sessions WHERE token = $1")
+        .bind(token)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
