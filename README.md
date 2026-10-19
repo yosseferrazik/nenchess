@@ -41,16 +41,23 @@ end-to-end tests.
   legality, checkmate, stalemate and flag fall.
 - **Automatic draws** — fifty-move rule, threefold repetition and insufficient
   material, all decided by the server from the authoritative position history.
+- **Ratings** — per-category Elo (`bullet`/`blitz`/`rapid`), computed
+  server-side when a rated game ends; K-factors 32/16/8 (FIDE-style tiers) and
+  a rating history appended in the same transaction as the result.
+- **Tournaments** — round-robin groups generated with the circle method (byes
+  for odd fields), creator-driven start, pairings that become real `games` rows
+  so the authoritative move pipeline applies unchanged, and standings (points →
+  Buchholz → rating) settled atomically as games finish.
 - **The hard parts, from day one** — optimistic versioning, idempotent
   commands, atomic persistence with a transactional outbox, resumable
   snapshots.
 - **Frontend** — auth, lobby with matchmaking and invite links, a board with
-  clocks, move list, promotion picker, spectator mode and automatic
-  reconnection.
+  clocks, move list, promotion picker, spectator mode, automatic
+  reconnection, and tournament create/join/start with live standings.
 
-Deliberately **not** built yet: ratings/ELO calculation, tournaments, PGN/SAN
-export, claim-based (rather than automatic) draws, email, push, CI deployment.
-See [Known limitations](#known-limitations).
+Deliberately **not** built yet: PGN/SAN export, claim-based (rather than
+automatic) draws, skill-based matchmaking, httpOnly cookie auth, email, push,
+CI deployment. See [Known limitations](#known-limitations).
 
 ---
 
@@ -81,8 +88,7 @@ See [Known limitations](#known-limitations).
   process; a restarted server rebuilds live state from the database.
 
 Modules (`services/api/src/modules/`): `identity`, `games`, `matchmaking`,
-`ratings`, `tournaments`. Only `identity` and `games` are implemented; the rest
-carry the intended contract and are wired into the router as they arrive.
+`ratings`, `tournaments` — all implemented and wired into the router.
 
 ## Repository layout
 
@@ -233,6 +239,9 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
   the engine behind `game-core` so the choice stays reversible.
 - **0002** — Authoritative server: optimistic concurrency, idempotent commands,
   and a transactional outbox for at-least-once delivery.
+- **0003** — Platform growth: per-category Elo settled with the game, a single
+  scheduler for matchmaking, and round-robin tournaments reusing the game
+  engine.
 
 ## Roadmap
 
@@ -241,7 +250,7 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 3. **Game domain & persistence** — ✅ move pipeline, clocks, results, atomicity.
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
-5. **Platform growth** — ⏳ ratings, tournaments; ✅ matchmaking, draw
+5. **Platform growth** — ✅ ratings, tournaments, matchmaking, draw
    detection.
 
 ## Known limitations
@@ -257,8 +266,6 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
   player claim. Fifty-move and stalemate are also automatic.
 - **Bearer tokens in `localStorage`.** Fine for the skeleton; httpOnly cookies
   are the intended hardening step.
-- **No ratings yet** — the `ratings` module and tables are reserved but not
-  populated.
 - **Matchmaking ignores rating.** Pairing is first-come-first-served per time
   control; there is no skill-based search yet.
 - **Engine coverage** — `cozy-chess` covers standard chess only; variants are
