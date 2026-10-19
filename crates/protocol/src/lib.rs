@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
+pub mod tournament;
+
+pub use tournament::{
+    CreateTournamentRequest, PairingDto, ParticipantDto, RoundDto, TournamentDto,
+    TournamentStatusDto, TournamentView, TournamentsResponse,
+};
+
 /// Current protocol version. Bump on breaking changes and coordinate with the
 /// frontend, which rejects connections with a mismatched version.
 pub const PROTOCOL_VERSION: u32 = 1;
