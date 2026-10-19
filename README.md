@@ -45,6 +45,12 @@ end-to-end tests.
   with a counter-offer is mutual agreement. Offers are auxiliary state (no
   version bump, cleared implicitly by a move) and acceptance settles ratings
   and tournaments like any other ending.
+- **PGN export & game history** — `GET /api/games/{id}/pgn` replays the
+  immutable move records from the starting position, rendering each move as
+  SAN through the rules kernel (headers carry both players, the time control
+  and the result token); `GET /api/me/games` lists the caller's games newest
+  first with colour, opponent and their own outcome, shown on the profile page
+  with one-click PGN downloads.
 - **Automatic draws** — fifty-move rule, threefold repetition and insufficient
   material, all decided by the server from the authoritative position history.
 - **Ratings** — per-category Elo (`bullet`/`blitz`/`rapid`), computed
@@ -59,10 +65,11 @@ end-to-end tests.
   snapshots.
 - **Frontend** — auth, lobby with matchmaking and invite links, a board with
   clocks, move list, promotion picker, spectator mode, automatic
-  reconnection, and tournament create/join/start with live standings.
+  reconnection, profile history with PGN downloads, and tournament
+  create/join/start with live standings.
 
-Deliberately **not** built yet: PGN/SAN export, claim-based (rather than
-automatic) draws, skill-based matchmaking, email, push,
+Deliberately **not** built yet: claim-based (rather than automatic) draws,
+skill-based matchmaking, email, push,
 CI deployment. See [Known limitations](#known-limitations).
 
 ---
@@ -267,7 +274,8 @@ cargo test --workspace
 
 # End-to-end: spawns the real server against a `nenchess_test` database and
 # drives it over HTTP and WebSocket (idempotency, version conflicts, races,
-# flag fall, resignation, draw offers, spectators, tournaments, ops probes,
+# flag fall, resignation, draw offers, PGN export & history, spectators,
+# tournaments, ops probes,
 # cookie/CSRF
 # lifecycle, rate-limit 429)
 cargo test -p nenchess-integration --test e2e -- --nocapture
@@ -305,7 +313,7 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
 5. **Platform growth** — ✅ ratings, tournaments, matchmaking, draw offers
-   and detection.
+   with automatic draw detection, PGN export & game history.
 
 ## Known limitations
 
