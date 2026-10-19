@@ -39,6 +39,10 @@ end-to-end tests.
   a login round-trip).
 - **Matchmaking** — enqueue for a time control; a background scheduler pairs two
   waiting players and hands each of them the resulting game id exactly once.
+  Rated queues are skill-gated: pairs must fall inside a rating window that
+  starts at ±150, widens two points per second anyone in the pair has waited
+  and caps at ±1000, nearest rating first; casual queues pair by time control
+  alone.
 - **Live play over WebSocket** — subscribe, move, resign; server-validated
   legality, checkmate, stalemate and flag fall.
 - **Draw offers** — propose, accept, decline or withdraw; answering an offer
@@ -69,7 +73,7 @@ end-to-end tests.
   create/join/start with live standings.
 
 Deliberately **not** built yet: claim-based (rather than automatic) draws,
-skill-based matchmaking, email, push,
+email, push,
 CI deployment. See [Known limitations](#known-limitations).
 
 ---
@@ -275,7 +279,7 @@ cargo test --workspace
 # End-to-end: spawns the real server against a `nenchess_test` database and
 # drives it over HTTP and WebSocket (idempotency, version conflicts, races,
 # flag fall, resignation, draw offers, PGN export & history, spectators,
-# tournaments, ops probes,
+# skill-based matchmaking, tournaments, ops probes,
 # cookie/CSRF
 # lifecycle, rate-limit 429)
 cargo test -p nenchess-integration --test e2e -- --nocapture
@@ -312,8 +316,8 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 3. **Game domain & persistence** — ✅ move pipeline, clocks, results, atomicity.
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
-5. **Platform growth** — ✅ ratings, tournaments, matchmaking, draw offers
-   with automatic draw detection, PGN export & game history.
+5. **Platform growth** — ✅ ratings, tournaments, skill-based matchmaking,
+   draw offers with automatic draw detection, PGN export & game history.
 
 ## Known limitations
 
@@ -329,8 +333,6 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
   would let the player claim instead. Fifty-move and stalemate are also
   automatic. Players can also agree to a draw (`game.draw_offer`), which does
   follow the standard offer/accept flow.
-- **Matchmaking ignores rating.** Pairing is first-come-first-served per time
-  control; there is no skill-based search yet.
 - **Engine coverage** — `cozy-chess` covers standard chess only; variants are
   out of scope for now.
 
