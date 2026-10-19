@@ -11,13 +11,14 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use nenchess_integration::{spawn_server, ws_url, ws_url_plain};
+use nenchess_integration::{spawn_server, test_database_url, ws_url, ws_url_plain};
 use protocol::{
     AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameHistoryResponse, GameOutcomeDto,
     GameView, MoveInputDto, ProfileDto, ServerMessage, UserDto,
 };
 use reqwest::StatusCode;
 use serde_json::json;
+use sqlx::Connection;
 use test_support::{black_player, white_player, TestUser};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -217,11 +218,31 @@ async fn enqueue(
     initial_time_ms: i64,
     increment_ms: i64,
 ) -> anyhow::Result<()> {
+    enqueue_as(api, token, initial_time_ms, increment_ms, false).await
+}
+
+/// Enter the *rated* queue — only rated queues are skill-gated.
+async fn enqueue_rated(
+    api: &Api,
+    token: &str,
+    initial_time_ms: i64,
+    increment_ms: i64,
+) -> anyhow::Result<()> {
+    enqueue_as(api, token, initial_time_ms, increment_ms, true).await
+}
+
+async fn enqueue_as(
+    api: &Api,
+    token: &str,
+    initial_time_ms: i64,
+    increment_ms: i64,
+    rated: bool,
+) -> anyhow::Result<()> {
     let (status, body) = api
         .post(
             "/api/matchmaking",
             Some(token),
-            json!({ "initial_time_ms": initial_time_ms, "increment_ms": increment_ms, "rated": false }),
+            json!({ "initial_time_ms": initial_time_ms, "increment_ms": increment_ms, "rated": rated }),
         )
         .await?;
     anyhow::ensure!(
@@ -233,6 +254,15 @@ async fn enqueue(
         "expected in_queue, got {body}"
     );
     Ok(())
+}
+
+/// Direct database access, used only to *stage* scenarios the API cannot
+/// arrange through its endpoints (seeding a rating gap, ageing a queue entry).
+/// Every assertion still goes through HTTP/WS.
+async fn stage_db() -> anyhow::Result<sqlx::PgConnection> {
+    sqlx::PgConnection::connect(&test_database_url())
+        .await
+        .context("connecting to the test database for staging")
 }
 
 /// Poll until the server reports a paired game. Returns its id.
@@ -418,6 +448,7 @@ async fn end_to_end() -> anyhow::Result<()> {
     draw_offer_scenarios(&api, &white, &black).await?;
     pgn_history_scenarios(&api, &white, &black).await?;
     matchmaking_scenario(&api).await?;
+    skill_matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
     tournament_scenario(&api).await?;
     ops_scenarios(&api).await?;
@@ -1378,6 +1409,89 @@ async fn matchmaking_scenario(api: &Api) -> anyhow::Result<()> {
         fifth_game, sixth_game,
         "a lone 3+2 entry must not block a 10+0 pairing"
     );
+
+    Ok(())
+}
+
+/// Skill-based matchmaking: rated queues only pair inside an expanding rating
+/// window (±150 fresh, +2 per second waited, capped at ±1000), nearest rating
+/// first; casual queues ignore ratings entirely.
+async fn skill_matchmaking_scenario(api: &Api) -> anyhow::Result<()> {
+    let far = register(api, &TestUser::new("skill_far")).await?;
+    let near = register(api, &TestUser::new("skill_near")).await?;
+
+    // Stage a rating gap: 10+0 belongs to the `rapid` ladder, and 2000 vs
+    // 1500 is far outside the fresh ±150 window.
+    let mut conn = stage_db().await?;
+    sqlx::query(
+        "UPDATE player_ratings SET rating = 2000 WHERE user_id = $1 AND category = 'rapid'",
+    )
+    .bind(far.user.id)
+    .execute(&mut conn)
+    .await?;
+
+    enqueue_rated(api, &far.token, 600_000, 0).await?;
+    enqueue_rated(api, &near.token, 600_000, 0).await?;
+
+    // Many scheduler ticks (50 ms each) pass with both waiting: a 500-point
+    // gap must not pair inside the fresh window.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (status, body) = api.get("/api/matchmaking", Some(&near.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["in_queue"], json!(true), "{body}");
+    assert_eq!(
+        body["game_id"],
+        serde_json::Value::Null,
+        "a 500-point gap must not pair inside the fresh window: {body}"
+    );
+
+    // Ten minutes of waiting grow the window past the gap: now they pair.
+    sqlx::query(
+        "UPDATE matchmaking_queue SET enqueued_at = now() - interval '10 minutes' \
+         WHERE user_id = $1 OR user_id = $2",
+    )
+    .bind(far.user.id)
+    .bind(near.user.id)
+    .execute(&mut conn)
+    .await?;
+    let far_game = await_match(api, &far.token).await?;
+    let near_game = await_match(api, &near.token).await?;
+    assert_eq!(far_game, near_game);
+
+    // Nearest-first: a fresh queue pairs the two closest ratings (1500 and
+    // 1510) and leaves the 2000-point outlier searching. Re-entering the queue
+    // gives everyone a fresh `enqueued_at`, so the window resets to ±150.
+    let mid = register(api, &TestUser::new("skill_mid")).await?;
+    sqlx::query(
+        "UPDATE player_ratings SET rating = 1510 WHERE user_id = $1 AND category = 'rapid'",
+    )
+    .bind(mid.user.id)
+    .execute(&mut conn)
+    .await?;
+    enqueue_rated(api, &far.token, 600_000, 0).await?;
+    enqueue_rated(api, &near.token, 600_000, 0).await?;
+    enqueue_rated(api, &mid.token, 600_000, 0).await?;
+
+    let near_game = await_match(api, &near.token).await?;
+    let mid_game = await_match(api, &mid.token).await?;
+    assert_eq!(near_game, mid_game, "the closest ratings pair first");
+
+    // The outlier is still searching and can leave whenever it wants.
+    let (status, body) = api.get("/api/matchmaking", Some(&far.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["in_queue"], json!(true), "the outlier waits: {body}");
+    assert_eq!(body["game_id"], serde_json::Value::Null);
+    let (status, body) = api.delete("/api/matchmaking", Some(&far.token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["in_queue"], json!(false));
+
+    // Casual queues ignore the gap: the same two players pair immediately
+    // with no window at all.
+    enqueue(api, &far.token, 600_000, 0).await?;
+    enqueue(api, &near.token, 600_000, 0).await?;
+    let far_game = await_match(api, &far.token).await?;
+    let near_game = await_match(api, &near.token).await?;
+    assert_eq!(far_game, near_game);
 
     Ok(())
 }

@@ -8,6 +8,9 @@
 //! * A matched pair writes `matched_game_id` in the same transaction that
 //!   creates the game, so the client is always pointed at a committed game.
 //! * Entering the queue again replaces the previous entry (and its match).
+//! * Rated queues are skill-gated: only pairs inside an expanding rating
+//!   window (±150 base, +2 per second waited, capped at ±1000) are created,
+//!   nearest rating first. Casual queues pair by time control alone.
 
 use protocol::{MatchmakingRequest, MatchmakingStatusDto};
 use uuid::Uuid;
@@ -97,13 +100,16 @@ pub async fn pair_once(state: &AppState) -> Result<bool, ApiError> {
     let mut tx = state.db.begin().await?;
 
     // The oldest waiting player *who has an opponent*, locked for this
-    // transaction. Entries that nobody can be paired with are skipped, so a
+    // transaction. Entries that nobody can be paired with — wrong time control,
+    // or (rated) outside everyone's current rating window — are skipped, so a
     // lone player never blocks the rest of the queue.
     let Some(first) = repo::oldest_matchable(&mut tx).await? else {
         return Ok(false);
     };
-    // Their earliest opponent with the same time control, also locked.
-    let Some(second) = repo::waiting_opponent(&mut tx, &first).await? else {
+    // Their best opponent with the same time control: inside the window and
+    // nearest in rating for rated queues, earliest for casual ones, also locked.
+    let category = crate::modules::ratings::category_for(first.initial_time_ms, first.increment_ms);
+    let Some(second) = repo::waiting_opponent(&mut tx, &first, category).await? else {
         // The candidate found by `oldest_matchable` was taken by a concurrent
         // pass (both queries use SKIP LOCKED); try again on the next tick.
         return Ok(false);

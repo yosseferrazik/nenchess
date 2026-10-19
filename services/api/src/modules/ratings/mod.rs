@@ -28,20 +28,38 @@ const PROVISIONAL_GAMES: i32 = 30;
 const MASTER_RATING: i32 = 2400;
 
 const CATEGORIES: [&str; 3] = ["bullet", "blitz", "rapid"];
-const DEFAULT_RATING: i32 = 1500;
+pub const DEFAULT_RATING: i32 = 1500;
+
+/// Expected game length is `initial + ESTIMATE_INCREMENT_FACTOR * increment`;
+/// below `BULLET_ESTIMATE_MAX` it is bullet, below `BLITZ_ESTIMATE_MAX` blitz,
+/// otherwise rapid (Lichess-style thresholds: 3+2 is blitz, 1+0 is bullet).
+const ESTIMATE_INCREMENT_FACTOR: i64 = 40;
+const BULLET_ESTIMATE_MAX: i64 = 180_000;
+const BLITZ_ESTIMATE_MAX: i64 = 600_000;
 
 /// Map a time control to a rating category.
 pub fn category_for(initial_time_ms: i64, increment_ms: i64) -> &'static str {
-    // Estimate the expected game length as initial + 40 * increment; the
-    // Lichess-style thresholds keep 3+2 a blitz and 1+0 a bullet.
-    let estimate = initial_time_ms.saturating_add(40 * increment_ms);
-    if estimate < 180_000 {
+    let estimate = initial_time_ms.saturating_add(ESTIMATE_INCREMENT_FACTOR * increment_ms);
+    if estimate < BULLET_ESTIMATE_MAX {
         "bullet"
-    } else if estimate < 600_000 {
+    } else if estimate < BLITZ_ESTIMATE_MAX {
         "blitz"
     } else {
         "rapid"
     }
+}
+
+/// The same mapping as [`category_for`], for callers stuck in SQL (the
+/// matchmaking pairing query needs the anchor's category before the anchor is
+/// known). Built from the same constants so the two definitions cannot drift
+/// apart silently; the e2e suite exercises the SQL path end to end.
+pub fn category_sql(initial_expr: &str, increment_expr: &str) -> String {
+    let estimate = format!("{initial_expr} + {ESTIMATE_INCREMENT_FACTOR} * {increment_expr}");
+    format!(
+        "CASE WHEN {estimate} < {BULLET_ESTIMATE_MAX} THEN 'bullet' \
+         WHEN {estimate} < {BLITZ_ESTIMATE_MAX} THEN 'blitz' \
+         ELSE 'rapid' END"
+    )
 }
 
 /// Probability that `rating` scores against `opponent` (logistic Elo curve).
@@ -150,6 +168,28 @@ mod tests {
         assert_eq!(category_for(300_000, 0), "blitz"); // 5+0
         assert_eq!(category_for(600_000, 0), "rapid"); // 10+0
         assert_eq!(category_for(900_000, 10_000), "rapid"); // 15+10
+    }
+
+    #[test]
+    fn category_sql_carries_the_same_thresholds() {
+        let sql = category_sql("g.initial_time_ms", "g.increment_ms");
+        // The SQL twin is a mechanical echo of `category_for`; the least we can
+        // check without a database is that it embeds the shared constants and
+        // labels, in the same order the Rust thresholds decide.
+        assert!(sql.contains(&BULLET_ESTIMATE_MAX.to_string()), "{sql}");
+        assert!(sql.contains(&BLITZ_ESTIMATE_MAX.to_string()), "{sql}");
+        assert!(
+            sql.contains("'bullet'") && sql.contains("'blitz'") && sql.contains("'rapid'"),
+            "{sql}"
+        );
+        let bullet = sql.find("THEN 'bullet'").expect("bullet branch");
+        let blitz = sql.find("THEN 'blitz'").expect("blitz branch");
+        let rapid = sql.find("ELSE 'rapid'").expect("rapid branch");
+        assert!(bullet < blitz && blitz < rapid, "branch order: {sql}");
+        assert!(
+            sql.contains("g.initial_time_ms + 40 * g.increment_ms"),
+            "{sql}"
+        );
     }
 
     #[test]
