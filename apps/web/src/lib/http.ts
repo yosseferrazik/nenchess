@@ -9,6 +9,7 @@ import type {
   CreateTournamentRequest,
   ErrorCode,
   GameView,
+  GameHistoryResponse,
   GamesResponse,
   LoginRequest,
   MatchmakingRequest,
@@ -81,6 +82,9 @@ export const http = {
   matchmakingStatus: () => request<MatchmakingStatusDto>('/matchmaking'),
   dequeue: () => request<MatchmakingStatusDto>('/matchmaking', { method: 'DELETE' }),
   profile: () => request<ProfileDto>('/profile'),
+  gameHistory: () => request<GameHistoryResponse>('/me/games'),
+  // Same-origin link: the session cookie authenticates it, no token in JS.
+  pgnUrl: (gameId: string) => `/api/games/${gameId}/pgn`,
   listTournaments: () => request<TournamentsResponse>('/tournaments'),
   createTournament: (body: CreateTournamentRequest) =>
     request<TournamentDto>('/tournaments', { method: 'POST', body }),

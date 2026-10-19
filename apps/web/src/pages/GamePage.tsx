@@ -4,6 +4,7 @@ import { useGameSocket } from '../lib/ws';
 import { Board } from '../components/Board';
 import { Clock } from '../components/Clock';
 import { useAuth } from '../lib/auth';
+import { http } from '../lib/http';
 import { copyInviteLink } from '../lib/invite';
 import type { GameView, ResultReasonDto } from '../lib/protocol';
 
@@ -85,6 +86,11 @@ export function GamePage({ gameId }: { gameId: string }) {
               acceptDraw={() => void acceptDraw().catch(() => undefined)}
               declineDraw={() => void declineDraw().catch(() => undefined)}
             />
+            {game.status === 'finished' && (
+              <a href={http.pgnUrl(gameId)} download>
+                Descargar PGN
+              </a>
+            )}
             <button type="button" className="secondary" onClick={() => void copyLink()}>
               {linkState === 'copied'
                 ? '¡enlace copiado!'
