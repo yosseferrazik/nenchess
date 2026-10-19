@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/games", post(games::create).get(games::list))
         .route("/games/{id}", get(games::get))
         .route("/games/{id}/join", post(games::join))
+        .route("/games/{id}/pgn", get(games::pgn))
         .route(
             "/matchmaking",
             post(matchmaking::enqueue)
@@ -50,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
                 .get(matchmaking::status),
         )
         .route("/profile", get(profile::get_profile))
+        .route("/me/games", get(profile::get_history))
         .route(
             "/tournaments",
             post(tournaments::create).get(tournaments::list),

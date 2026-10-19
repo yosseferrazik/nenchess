@@ -278,3 +278,73 @@ pub async fn moves_for(
         })
         .collect()
 }
+
+/// A row of a player's game history: the game plus both usernames.
+#[derive(Debug, sqlx::FromRow)]
+pub struct HistoryRow {
+    pub id: Uuid,
+    pub status: String,
+    pub result_winner: Option<String>,
+    pub result_reason: Option<String>,
+    pub rated: bool,
+    pub initial_time_ms: i64,
+    pub increment_ms: i64,
+    pub move_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub white_player_id: Uuid,
+    pub black_player_id: Option<Uuid>,
+    pub white_username: String,
+    pub black_username: Option<String>,
+}
+
+/// One player's games (as white or black), newest first. Waiting games are
+/// lobby material, not history, so they are left out.
+pub async fn history_for(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<HistoryRow>, sqlx::Error> {
+    sqlx::query_as::<_, HistoryRow>(
+        "SELECT g.id, g.status, g.result_winner, g.result_reason, g.rated, \
+         g.initial_time_ms, g.increment_ms, g.move_count, g.created_at, \
+         g.white_player_id, g.black_player_id, \
+         w.username AS white_username, b.username AS black_username \
+         FROM games g \
+         JOIN users w ON w.id = g.white_player_id \
+         LEFT JOIN users b ON b.id = g.black_player_id \
+         WHERE (g.white_player_id = $1 OR g.black_player_id = $1) \
+           AND g.status <> 'waiting' \
+         ORDER BY g.created_at DESC, g.id DESC \
+         LIMIT $2 OFFSET $3",
+    )
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(conn)
+    .await
+}
+
+/// Header facts an export needs: when the game was created and who played it.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PgnMeta {
+    pub created_at: DateTime<Utc>,
+    pub white_username: String,
+    pub black_username: Option<String>,
+}
+
+pub async fn pgn_meta(
+    conn: &mut PgConnection,
+    game_id: Uuid,
+) -> Result<Option<PgnMeta>, sqlx::Error> {
+    sqlx::query_as::<_, PgnMeta>(
+        "SELECT g.created_at, w.username AS white_username, b.username AS black_username \
+         FROM games g \
+         JOIN users w ON w.id = g.white_player_id \
+         LEFT JOIN users b ON b.id = g.black_player_id \
+         WHERE g.id = $1",
+    )
+    .bind(game_id)
+    .fetch_optional(conn)
+    .await
+}

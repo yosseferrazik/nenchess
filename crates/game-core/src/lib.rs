@@ -9,12 +9,14 @@
 //! could be swapped without touching callers.
 
 mod clock;
+mod notation;
 mod rules;
 mod types;
 
 pub use clock::Clock;
+pub use notation::san;
 pub use rules::{
-    insufficient_material, legal_moves, position_hash, starting_fen, status, validate_and_apply,
-    DrawKind, GameStatus, MoveError, MoveInput, STARTING_FEN,
+    insufficient_material, legal_moves, normalize, position_hash, starting_fen, status,
+    validate_and_apply, DrawKind, GameStatus, MoveError, MoveInput, STARTING_FEN,
 };
 pub use types::{Color, PieceKind, Square};

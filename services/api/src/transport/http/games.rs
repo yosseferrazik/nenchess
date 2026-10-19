@@ -1,8 +1,12 @@
+use axum::body::Body;
 use axum::extract::{Path, State};
+use axum::http::{header, HeaderValue};
+use axum::response::Response;
 use axum::{Extension, Json};
 use protocol::{CreateGameRequest, GameView, GamesResponse};
 use uuid::Uuid;
 
+use crate::application::export;
 use crate::bootstrap::AppState;
 use crate::error::ApiError;
 use crate::modules::games;
@@ -41,4 +45,28 @@ pub async fn join(
 ) -> Result<Json<GameView>, ApiError> {
     let view = games::join_game(&state, user.0.id, id).await?;
     Ok(Json(view))
+}
+
+/// PGN export of any game, replayed from the immutable move records with SAN
+/// rendered by the rules kernel. Same visibility as the game itself: any
+/// authenticated reader.
+pub async fn pgn(
+    State(state): State<AppState>,
+    Extension(_user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let mut conn = state.db.acquire().await?;
+    let body = export::game_pgn(&mut conn, id).await?;
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"game-{id}.pgn\""))
+            .expect("uuid filenames are valid header values"),
+    );
+    Ok(response)
 }

@@ -245,6 +245,48 @@ pub struct GamesResponse {
     pub games: Vec<GameView>,
 }
 
+/// The caller's outcome in a finished game, for list rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum GameOutcomeDto {
+    Win,
+    Draw,
+    Loss,
+}
+
+/// One game of the caller's profile history (seen as white or black).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GameHistoryEntryDto {
+    pub game_id: Uuid,
+    /// The caller's colour in this game.
+    pub color: ColorDto,
+    /// The opponent; `null` only while the game still waits for them.
+    pub opponent: Option<PlayerDto>,
+    pub status: GameStatusDto,
+    /// Set once the game finished.
+    pub result: Option<GameResultDto>,
+    /// The caller's outcome; `null` while the game is in progress.
+    pub outcome: Option<GameOutcomeDto>,
+    pub rated: bool,
+    #[ts(type = "number")]
+    pub initial_time_ms: i64,
+    #[ts(type = "number")]
+    pub increment_ms: i64,
+    pub move_count: i32,
+    /// When the game was created (epoch ms).
+    #[ts(type = "number")]
+    pub started_at_ms: i64,
+}
+
+/// A page of the caller's game history, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct GameHistoryResponse {
+    pub games: Vec<GameHistoryEntryDto>,
+}
+
 // ---------------------------------------------------------------------------
 // Matchmaking
 // ---------------------------------------------------------------------------

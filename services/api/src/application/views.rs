@@ -112,7 +112,7 @@ pub fn piece_dto(piece: PieceKind) -> PieceKindDto {
     }
 }
 
-fn status_dto(status: GameStatus) -> GameStatusDto {
+pub fn status_dto(status: GameStatus) -> GameStatusDto {
     match status {
         GameStatus::Waiting => GameStatusDto::Waiting,
         GameStatus::Active => GameStatusDto::Active,
@@ -120,7 +120,7 @@ fn status_dto(status: GameStatus) -> GameStatusDto {
     }
 }
 
-fn reason_dto(reason: ResultReason) -> ResultReasonDto {
+pub fn reason_dto(reason: ResultReason) -> ResultReasonDto {
     match reason {
         ResultReason::Checkmate => ResultReasonDto::Checkmate,
         ResultReason::Stalemate => ResultReasonDto::Stalemate,

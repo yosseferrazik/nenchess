@@ -2,6 +2,7 @@
 //! authorization glue and view assembly. Transport calls into here; the
 //! domain stays pure.
 
+pub mod export;
 pub mod moves;
 pub mod views;
 

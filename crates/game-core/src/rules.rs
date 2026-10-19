@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-use cozy_chess::{BitBoard, Board, Move as EngineMove, Piece, Square as EngineSquare};
+use cozy_chess::{BitBoard, Board, File, Move as EngineMove, Piece, Square as EngineSquare};
 use thiserror::Error;
 
 use crate::types::{Color, PieceKind, Square};
@@ -104,8 +104,7 @@ pub enum MoveError {
 pub fn validate_and_apply(fen: &str, mv: &MoveInput) -> Result<(String, GameStatus), MoveError> {
     let mut board = parse_fen(fen)?;
     let uci = mv.to_uci();
-    let engine_move =
-        EngineMove::from_str(&uci).map_err(|_| MoveError::IllegalMove(uci.clone()))?;
+    let engine_move = to_engine_move(&board, mv)?;
     if !board.is_legal(engine_move) {
         return Err(MoveError::IllegalMove(uci));
     }
@@ -122,17 +121,76 @@ pub fn status(fen: &str) -> Result<GameStatus, MoveError> {
     position_status(&board)
 }
 
-/// All legal moves of the position, in UCI notation.
+/// The canonical (standard-UCI) spelling of a move that is legal in `fen`.
+///
+/// A nonstandard client may spell castling as king-takes-rook; records,
+/// views and exports always speak king-moves-two, so downstream consumers
+/// never need to know the engine's representation.
+pub fn normalize(fen: &str, mv: &MoveInput) -> Result<MoveInput, MoveError> {
+    let board = parse_fen(fen)?;
+    let engine_move = to_engine_move(&board, mv)?;
+    if !board.is_legal(engine_move) {
+        return Err(MoveError::IllegalMove(mv.to_uci()));
+    }
+    MoveInput::from_uci(&engine_move_to_uci(&board, engine_move))
+}
+
+/// All legal moves of the position, in (standard) UCI notation. Castling is
+/// spelled the way clients and every UI expect it: the king moving two
+/// squares (`e1g1`), never king-takes-rook.
 pub fn legal_moves(fen: &str) -> Result<Vec<String>, MoveError> {
     let board = parse_fen(fen)?;
     let mut moves = Vec::new();
     board.generate_moves(|piece_moves| {
         for mv in piece_moves {
-            moves.push(mv.to_string());
+            moves.push(engine_move_to_uci(&board, mv));
         }
         false
     });
     Ok(moves)
+}
+
+/// `cozy-chess` expresses castling as the king moving onto its rook
+/// (chess960-compatible); standard UCI — and every chess UI — expresses it
+/// as the king moving two squares. Accept both spellings so clients never
+/// need to know the engine's representation.
+pub(crate) fn to_engine_move(board: &Board, mv: &MoveInput) -> Result<EngineMove, MoveError> {
+    let uci = mv.to_uci();
+    let direct = EngineMove::from_str(&uci).map_err(|_| MoveError::IllegalMove(uci.clone()))?;
+    // Castling is the only king move that changes files (by two of them).
+    let is_king = board.piece_on(direct.from) == Some(Piece::King);
+    if is_king && direct.from.file() != direct.to.file() {
+        let rook_file = if (direct.to.file() as usize) > (direct.from.file() as usize) {
+            File::H
+        } else {
+            File::A
+        };
+        return Ok(EngineMove {
+            from: direct.from,
+            to: EngineSquare::new(rook_file, direct.from.rank()),
+            promotion: None,
+        });
+    }
+    Ok(direct)
+}
+
+/// The standard UCI spelling of an engine move (the inverse of
+/// [`to_engine_move`]).
+pub(crate) fn engine_move_to_uci(board: &Board, mv: EngineMove) -> String {
+    let is_king = board.piece_on(mv.from) == Some(Piece::King);
+    if is_king && (mv.to.file() as usize).abs_diff(mv.from.file() as usize) > 1 {
+        let dest_file = if (mv.to.file() as usize) > (mv.from.file() as usize) {
+            File::G
+        } else {
+            File::C
+        };
+        return format!(
+            "{}{}",
+            mv.from,
+            EngineSquare::new(dest_file, mv.from.rank())
+        );
+    }
+    mv.to_string()
 }
 
 /// A Zobrist hash that identifies a position for repetition detection: two
@@ -349,5 +407,83 @@ mod tests {
         assert_eq!(mv.to_uci(), "e7e8n");
         assert_eq!(mv.promotion, Some(PieceKind::Knight));
         assert!(MoveInput::from_uci("xyz").is_err());
+    }
+
+    #[test]
+    fn castling_is_accepted_in_both_spellings() {
+        let fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
+        // Standard UCI — what every UI sends: the king moves two squares.
+        let (after, status) =
+            validate_and_apply(fen, &MoveInput::from_uci("e1g1").unwrap()).unwrap();
+        assert_eq!(status, GameStatus::InProgress);
+        assert!(
+            after.starts_with("r3k2r/8/8/8/8/8/8/R4RK1"),
+            "unexpected FEN: {after}"
+        );
+        // The engine's own spelling (king takes rook) is accepted too.
+        let (after, _) = validate_and_apply(fen, &MoveInput::from_uci("e1h1").unwrap()).unwrap();
+        assert!(
+            after.starts_with("r3k2r/8/8/8/8/8/8/R4RK1"),
+            "unexpected FEN: {after}"
+        );
+        // Queenside, both spellings: the h1 rook stays, the a1 rook lands on
+        // d1 and the king on c1.
+        let (after, _) = validate_and_apply(fen, &MoveInput::from_uci("e1c1").unwrap()).unwrap();
+        assert!(
+            after.starts_with("r3k2r/8/8/8/8/8/8/2KR3R"),
+            "unexpected FEN: {after}"
+        );
+        let (after, _) = validate_and_apply(fen, &MoveInput::from_uci("e1a1").unwrap()).unwrap();
+        assert!(
+            after.starts_with("r3k2r/8/8/8/8/8/8/2KR3R"),
+            "unexpected FEN: {after}"
+        );
+    }
+
+    #[test]
+    fn legal_moves_speak_standard_uci() {
+        let fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
+        let moves = legal_moves(fen).unwrap();
+        assert!(
+            moves.contains(&"e1g1".to_string()),
+            "missing e1g1: {moves:?}"
+        );
+        assert!(
+            moves.contains(&"e1c1".to_string()),
+            "missing e1c1: {moves:?}"
+        );
+        assert!(
+            !moves.contains(&"e1h1".to_string()),
+            "engine spelling leaked"
+        );
+        assert!(
+            !moves.contains(&"e1a1".to_string()),
+            "engine spelling leaked"
+        );
+    }
+
+    #[test]
+    fn castling_is_rejected_when_the_path_is_attacked() {
+        // A black bishop on c5 controls g1: white may not castle that way.
+        let fen = "r3k2r/8/8/2b5/8/8/8/R3K2R w KQkq - 0 1";
+        let mv = MoveInput::from_uci("e1g1").unwrap();
+        assert!(matches!(
+            validate_and_apply(fen, &mv),
+            Err(MoveError::IllegalMove(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_canonicalizes_castling_spellings() {
+        let fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1";
+        let mv = MoveInput::from_uci("e1h1").unwrap();
+        assert_eq!(normalize(fen, &mv).unwrap().to_uci(), "e1g1");
+        let mv = MoveInput::from_uci("e1a1").unwrap();
+        assert_eq!(normalize(fen, &mv).unwrap().to_uci(), "e1c1");
+        // Ordinary moves pass through unchanged.
+        let mv = MoveInput::from_uci("e1e2").unwrap();
+        assert_eq!(normalize(fen, &mv).unwrap().to_uci(), "e1e2");
+        // Illegal moves are still rejected.
+        assert!(normalize(fen, &MoveInput::from_uci("e1e5").unwrap()).is_err());
     }
 }

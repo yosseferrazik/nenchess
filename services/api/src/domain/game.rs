@@ -3,7 +3,7 @@
 //! tested without a database, a socket or a framework.
 
 use game_core::{
-    position_hash, starting_fen, validate_and_apply, Clock, Color, DrawKind,
+    normalize, position_hash, starting_fen, validate_and_apply, Clock, Color, DrawKind,
     GameStatus as RulesStatus, MoveInput, PieceKind, Square,
 };
 use uuid::Uuid;
@@ -267,6 +267,12 @@ pub fn apply_move(
     let (fen_after, rules_status) = validate_and_apply(&game.fen, mv)
         .map_err(|err| DomainError::IllegalMove(err.to_string()))?;
 
+    // Everyone downstream — records, views, exports — speaks standard UCI.
+    // A client may spell castling as king-takes-rook; the engine accepted it
+    // above, so canonicalizing here cannot fail.
+    let canonical =
+        normalize(&game.fen, mv).expect("the move validated against the same position just above");
+
     let mut g = game;
     g.version += 1;
     g.move_count += 1;
@@ -332,10 +338,10 @@ pub fn apply_move(
 
     let applied = MoveRecord {
         move_number,
-        from: mv.from,
-        to: mv.to,
-        promotion: mv.promotion,
-        uci: mv.to_uci(),
+        from: canonical.from,
+        to: canonical.to,
+        promotion: canonical.promotion,
+        uci: canonical.to_uci(),
     };
     Ok(MoveOutcome::Applied {
         game: g,

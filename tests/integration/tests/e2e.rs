@@ -13,8 +13,8 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use nenchess_integration::{spawn_server, ws_url, ws_url_plain};
 use protocol::{
-    AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameView, MoveInputDto, ProfileDto,
-    ServerMessage, UserDto,
+    AppliedMoveDto, AuthResponse, ClientMessage, ErrorCode, GameHistoryResponse, GameOutcomeDto,
+    GameView, MoveInputDto, ProfileDto, ServerMessage, UserDto,
 };
 use reqwest::StatusCode;
 use serde_json::json;
@@ -73,6 +73,27 @@ impl Api {
         let status = response.status();
         let body = response.json().await.unwrap_or(serde_json::Value::Null);
         Ok((status, body))
+    }
+
+    /// GET returning the raw body and content type (for text exports).
+    async fn get_text(
+        &self,
+        path: &str,
+        token: Option<&str>,
+    ) -> anyhow::Result<(StatusCode, String, String)> {
+        let mut request = self.client.get(format!("{}{path}", self.base));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok((status, content_type, response.text().await?))
     }
 
     async fn delete(
@@ -395,6 +416,7 @@ async fn end_to_end() -> anyhow::Result<()> {
     repetition_scenario(&api, &white, &black).await?;
     spectator_scenario(&api, &white, &black).await?;
     draw_offer_scenarios(&api, &white, &black).await?;
+    pgn_history_scenarios(&api, &white, &black).await?;
     matchmaking_scenario(&api).await?;
     ratings_scenario(&api).await?;
     tournament_scenario(&api).await?;
@@ -1126,6 +1148,150 @@ async fn draw_offer_scenarios(
     expect_error(
         white_peer.response_to(command_id(&late_offer)).await?,
         ErrorCode::GameOver,
+    );
+
+    Ok(())
+}
+
+/// PGN export and profile history: SAN replayed from the immutable records,
+/// correct headers and result token, and each caller's own outcome.
+async fn pgn_history_scenarios(
+    api: &Api,
+    white: &AuthResponse,
+    black: &AuthResponse,
+) -> anyhow::Result<()> {
+    // Scholar's mate so the PGN carries a real, checkmate-terminated game.
+    let game = create_game(api, &white.token, 600_000).await?;
+    let game_id = game.id;
+    join_game(api, &black.token, game_id).await?;
+
+    let mut white_peer = Peer::connect(&api.base, &white.token, "pgn-white").await?;
+    let mut black_peer = Peer::connect(&api.base, &black.token, "pgn-black").await?;
+    let white_sub = subscribe(game_id);
+    white_peer.send(&white_sub).await?;
+    expect_state(white_peer.response_to(command_id(&white_sub)).await?);
+    let black_sub = subscribe(game_id);
+    black_peer.send(&black_sub).await?;
+    expect_state(black_peer.response_to(command_id(&black_sub)).await?);
+
+    let script: [(&str, i64); 4] = [("f2f3", 1), ("e7e5", 2), ("g2g4", 3), ("d8h4", 4)];
+    for (uci, version) in script {
+        let command = move_command(game_id, version, uci);
+        let peer = if version % 2 == 1 {
+            &mut white_peer
+        } else {
+            &mut black_peer
+        };
+        peer.send(&command).await?;
+        let response = peer.response_to(command_id(&command)).await?;
+        if version < 4 {
+            let applied = expect_accepted(response);
+            assert_eq!(applied.uci, uci);
+        } else {
+            // The mating move settles the game through the same path as any
+            // other ending: one version bump past the last move.
+            let view = expect_state(response);
+            assert_eq!(view.status, protocol::GameStatusDto::Finished);
+            assert_eq!(view.version, 5);
+        }
+    }
+
+    // PGN: headers carry both players, the time control and the decisive
+    // result; the movetext is SAN with the kernel's check/mate suffixes.
+    let (status, content_type, pgn) = api
+        .get_text(&format!("/api/games/{game_id}/pgn"), Some(&white.token))
+        .await?;
+    assert_eq!(status, StatusCode::OK, "pgn export: {pgn}");
+    assert!(
+        content_type.starts_with("text/plain"),
+        "unexpected content type: {content_type}"
+    );
+    assert!(
+        pgn.contains(&format!("[White \"{}\"]", white.user.username)),
+        "{pgn}"
+    );
+    assert!(
+        pgn.contains(&format!("[Black \"{}\"]", black.user.username)),
+        "{pgn}"
+    );
+    assert!(pgn.contains("[Result \"0-1\"]"), "{pgn}");
+    assert!(pgn.contains("[TimeControl \"600+0\"]"), "{pgn}");
+    assert!(pgn.contains("1. f3 e5 2. g4 Qh4# 0-1"), "{pgn}");
+
+    // Profile history: newest first, the caller's own colour and outcome.
+    let (status, body) = api.get("/api/me/games", Some(&black.token)).await?;
+    assert_eq!(status, StatusCode::OK, "history: {body}");
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    assert_eq!(
+        history.games.first().map(|entry| entry.game_id),
+        Some(game_id),
+        "the newest game leads black's history"
+    );
+    let entry = history
+        .games
+        .iter()
+        .find(|entry| entry.game_id == game_id)
+        .expect("the finished game is listed");
+    assert_eq!(entry.color, protocol::ColorDto::Black);
+    assert_eq!(entry.outcome, Some(GameOutcomeDto::Win));
+    assert_eq!(entry.status, protocol::GameStatusDto::Finished);
+    assert_eq!(entry.move_count, 4);
+    assert!(!entry.rated);
+    let result = entry.result.expect("finished game carries a result");
+    assert_eq!(result.winner, Some(protocol::ColorDto::Black));
+    assert_eq!(result.reason, protocol::ResultReasonDto::Checkmate);
+    assert_eq!(
+        entry
+            .opponent
+            .as_ref()
+            .map(|opponent| opponent.username.as_str()),
+        Some(white.user.username.as_str())
+    );
+
+    // The white player sees the mirror outcome.
+    let (_, body) = api.get("/api/me/games", Some(&white.token)).await?;
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    let entry = history
+        .games
+        .iter()
+        .find(|entry| entry.game_id == game_id)
+        .expect("the finished game is listed");
+    assert_eq!(entry.color, protocol::ColorDto::White);
+    assert_eq!(entry.outcome, Some(GameOutcomeDto::Loss));
+
+    // Waiting games are lobby material, not history.
+    let waiting = create_game(api, &white.token, 600_000).await?;
+    let (_, body) = api.get("/api/me/games", Some(&white.token)).await?;
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    assert!(!history
+        .games
+        .iter()
+        .any(|entry| entry.game_id == waiting.id));
+
+    // `limit` is clamped server-side, `offset` past the end is an empty page.
+    let (_, body) = api.get("/api/me/games?limit=1", Some(&black.token)).await?;
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    assert_eq!(history.games.len(), 1);
+    assert_eq!(history.games[0].game_id, game_id);
+    let (_, body) = api
+        .get("/api/me/games?limit=999999", Some(&black.token))
+        .await?;
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    assert!(history.games.len() <= 100, "limit must be clamped");
+    let (_, body) = api
+        .get("/api/me/games?offset=100000", Some(&black.token))
+        .await?;
+    let history: GameHistoryResponse = serde_json::from_value(body)?;
+    assert!(history.games.is_empty());
+
+    // Both endpoints authenticate like every other read.
+    assert_eq!(
+        api.get("/api/me/games", None).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        api.get(&format!("/api/games/{game_id}/pgn"), None).await?.0,
+        StatusCode::UNAUTHORIZED
     );
 
     Ok(())
