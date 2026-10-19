@@ -41,6 +41,10 @@ end-to-end tests.
   waiting players and hands each of them the resulting game id exactly once.
 - **Live play over WebSocket** — subscribe, move, resign; server-validated
   legality, checkmate, stalemate and flag fall.
+- **Draw offers** — propose, accept, decline or withdraw; answering an offer
+  with a counter-offer is mutual agreement. Offers are auxiliary state (no
+  version bump, cleared implicitly by a move) and acceptance settles ratings
+  and tournaments like any other ending.
 - **Automatic draws** — fifty-move rule, threefold repetition and insufficient
   material, all decided by the server from the authoritative position history.
 - **Ratings** — per-category Elo (`bullet`/`blitz`/`rapid`), computed
@@ -263,7 +267,8 @@ cargo test --workspace
 
 # End-to-end: spawns the real server against a `nenchess_test` database and
 # drives it over HTTP and WebSocket (idempotency, version conflicts, races,
-# flag fall, resignation, spectators, tournaments, ops probes, cookie/CSRF
+# flag fall, resignation, draw offers, spectators, tournaments, ops probes,
+# cookie/CSRF
 # lifecycle, rate-limit 429)
 cargo test -p nenchess-integration --test e2e -- --nocapture
 
@@ -299,8 +304,8 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
 3. **Game domain & persistence** — ✅ move pipeline, clocks, results, atomicity.
 4. **Multiplayer & resilience** — ✅ WebSocket hub, reconnection, snapshots; ⏳
    multi-replica fan-out.
-5. **Platform growth** — ✅ ratings, tournaments, matchmaking, draw
-   detection.
+5. **Platform growth** — ✅ ratings, tournaments, matchmaking, draw offers
+   and detection.
 
 ## Known limitations
 
@@ -311,9 +316,11 @@ Architecture decision records live in [`docs/adr/`](docs/adr/):
   publisher for a shared broker and the lock for a database/broker-level one;
   the pairing SQL already uses `FOR UPDATE SKIP LOCKED`, so the scheduler
   itself is safe to run in parallel. The outbox contract does not change.
-- **Draws are automatic, not claimed.** Threefold repetition and insufficient
-  material end the game as soon as the server detects them; FIDE would let the
-  player claim. Fifty-move and stalemate are also automatic.
+- **Draws by rule are automatic, not claimed.** Threefold repetition and
+  insufficient material end the game as soon as the server detects them; FIDE
+  would let the player claim instead. Fifty-move and stalemate are also
+  automatic. Players can also agree to a draw (`game.draw_offer`), which does
+  follow the standard offer/accept flow.
 - **Matchmaking ignores rating.** Pairing is first-come-first-served per time
   control; there is no skill-based search yet.
 - **Engine coverage** — `cozy-chess` covers standard chess only; variants are
